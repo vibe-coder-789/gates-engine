@@ -1,0 +1,85 @@
+{
+ "as_of": "2026-08-16",
+ "tickers": {
+  "EME": {
+   "grade": "A",
+   "ensemble": 0.1396,
+   "med": 0.122,
+   "p_loss": 0.18,
+   "pe": 26.0,
+   "price_asof": 836.29
+  },
+  "PWR": {
+   "grade": "B",
+   "ensemble": 0.1449,
+   "med": 0.096,
+   "p_loss": 0.27,
+   "pe": 78.6,
+   "price_asof": 685.78
+  },
+  "WMB": {
+   "grade": "C",
+   "ensemble": 0.0911,
+   "med": 0.084,
+   "p_loss": 0.44,
+   "pe": 30.0,
+   "price_asof": 75.2
+  },
+  "KMI": {
+   "grade": null,
+   "ensemble": null,
+   "med": 0.114,
+   "p_loss": 0.45,
+   "pe": 21.0,
+   "price_asof": 32.82
+  },
+  "MU": {
+   "grade": "C",
+   "ensemble": 0.179,
+   "med": 0.145,
+   "p_loss": 0.41,
+   "pe": 22.0,
+   "price_asof": 971.66
+  },
+  "COHR": {
+   "grade": "C",
+   "ensemble": 0.0727,
+   "med": -0.057,
+   "p_loss": 0.58,
+   "pe": 79.1,
+   "price_asof": 325.83
+  },
+  "FN": {
+   "grade": "C",
+   "ensemble": 0.1419,
+   "med": 0.053,
+   "p_loss": 0.41,
+   "pe": 49.0,
+   "price_asof": 570.22
+  },
+  "VST": {
+   "grade": null,
+   "ensemble": null,
+   "med": 0.243,
+   "p_loss": 0.34,
+   "pe": 25.0,
+   "price_asof": 148.13
+  },
+  "MSFT": {
+   "grade": "C",
+   "ensemble": 0.1394,
+   "med": 0.158,
+   "p_loss": 0.08,
+   "pe": 27.6,
+   "price_asof": 495.4
+  },
+  "AAPL": {
+   "grade": null,
+   "ensemble": null,
+   "med": 0.055,
+   "p_loss": 0.12,
+   "pe": 35.1,
+   "price_asof": 305.93
+  }
+ }
+}
