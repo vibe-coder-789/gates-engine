@@ -130,10 +130,21 @@ def quarterly_dps(cik, ticker):
             continue
     return {}
 
+def last_split_date(ticker):
+    """Most recent stock-split date (or None). Splits break the basis match
+    between Yahoo's retroactively-adjusted prices and EDGAR's as-filed EPS."""
+    d = _fetch("https://query1.finance.yahoo.com/v8/finance/chart/%s?range=25y&interval=1mo&events=splits"
+               % ticker.upper(), 24, ticker.lower() + "_px2")
+    ev = (d["chart"]["result"][0].get("events") or {}).get("splits") or {}
+    if not ev:
+        return None
+    ts = max(int(v["date"]) for v in ev.values())
+    return datetime.utcfromtimestamp(ts).date()
+
 def monthly_prices(ticker):
     """[(date, close, adjclose)] month bars from Yahoo; drops current partial month."""
-    d = _fetch("https://query1.finance.yahoo.com/v8/finance/chart/%s?range=25y&interval=1mo"
-               % ticker.upper(), 24, ticker.lower() + "_px")
+    d = _fetch("https://query1.finance.yahoo.com/v8/finance/chart/%s?range=25y&interval=1mo&events=splits"
+               % ticker.upper(), 24, ticker.lower() + "_px2")
     r = d["chart"]["result"][0]
     ts = r["timestamp"]
     close = r["indicators"]["quote"][0]["close"]
@@ -155,9 +166,14 @@ def month_end(d):
     nxt = date(d.year + (d.month == 12), (d.month % 12) + 1, 1)
     return nxt - timedelta(days=1)
 
-def build_panel(prices, eps_q, dps_q):
-    """Monthly panel rows: dict(date, px, adj, eps_ttm, dps_ttm, m) with pub lag."""
+def build_panel(prices, eps_q, dps_q, min_q_end=None):
+    """Monthly panel rows: dict(date, px, adj, eps_ttm, dps_ttm, m) with pub lag.
+    min_q_end (a date): drop TTM windows containing quarters before it — used to
+    exclude pre-split quarters whose as-filed EPS basis mismatches adjusted
+    prices (the split-basis trap: old-basis EPS makes P/E look 4-10x too low)."""
     q_ends = sorted(date.fromisoformat(k) for k in eps_q)
+    if min_q_end:
+        q_ends = [q for q in q_ends if q >= min_q_end]
     panel = []
     for (dt, px, adj) in prices:
         me = month_end(dt)
@@ -222,6 +238,17 @@ def estimate(panel):
     if ou.get("ok") and ou["sigma"] > 0.60:      # cap pathological vol, flag it
         ou["sigma"] = 0.60
         ou["sigma_capped"] = True
+    # near-unit-root guard: when b ~ 1 the unconditional mean a/(1-b) explodes
+    # (e.g. an "anchor" of 58x for a stock that never traded there). Clamp the
+    # anchor to within 1 sd of the observed median log-multiple and flag it.
+    if ou.get("ok"):
+        med_lnm = sorted(lnm)[len(lnm)//2]
+        sd_lnm = statistics.pstdev(lnm) or 1e-6
+        if abs(ou["lnbar"] - med_lnm) > sd_lnm:
+            ou = dict(ou)
+            ou["lnbar_prefit"] = ou["lnbar"]
+            ou["lnbar"] = med_lnm + (sd_lnm if ou["lnbar"] > med_lnm else -sd_lnm)
+            ou["anchor_clamped"] = True
     # quarterly EPS-ttm growth series (every 3rd month to approximate quarters)
     eps_series = [r["eps"] for r in panel if r["eps"] > 0]
     dlnE_q = []
@@ -597,9 +624,11 @@ def run(ticker, horizon=5, paths=8000, bt_h=3, do_backtest=True):
     eps_q = quarterly_eps(cik, ticker)
     dps_q = quarterly_dps(cik, ticker)
     px = monthly_prices(ticker)
-    panel = build_panel(px, eps_q, dps_q)
+    lsd = last_split_date(ticker)
+    panel = build_panel(px, eps_q, dps_q, min_q_end=lsd)
     if len(panel) < MIN_FIT_MONTHS:
-        raise SystemExit("only %d usable months for %s — need %d" % (len(panel), ticker, MIN_FIT_MONTHS))
+        raise SystemExit("only %d usable months for %s — need %d%s" % (len(panel), ticker, MIN_FIT_MONTHS,
+                         " (history truncated at %s stock split: as-filed EPS basis mismatches split-adjusted prices before it)" % lsd if lsd else ""))
     est = estimate(panel)
     if est is None:
         raise SystemExit("estimation failed for %s" % ticker)
@@ -637,12 +666,15 @@ def bundle(tickers, horizon=5, paths=5000, bt_h=3, out="bundle.json"):
         try:
             cik, title = ticker_to_cik(t)
             eps_q = quarterly_eps(cik, t); dps_q = quarterly_dps(cik, t)
-            panel = build_panel(monthly_prices(t), eps_q, dps_q)
+            lsd = last_split_date(t)
+            panel = build_panel(monthly_prices(t), eps_q, dps_q, min_q_end=lsd)
             est = estimate(panel)
             row = panel[-1] if panel else None
             if est is None or not row or not row["m"] or row["m"] <= 0:
                 reason = ("negative trailing EPS — option, not a compounder; model declines to price it"
-                          if row and row["eps"] <= 0 else "insufficient usable history (<%d months)" % MIN_FIT_MONTHS)
+                          if row and row["eps"] <= 0 else
+                          "insufficient basis-consistent history (<%d months%s)" % (MIN_FIT_MONTHS,
+                          "; truncated at %s stock split — as-filed EPS basis mismatches adjusted prices before it" % lsd if lsd else ""))
                 data["failed"][t.upper()] = reason
                 print("SKIP %s: %s" % (t, reason), file=sys.stderr)
                 continue
@@ -670,6 +702,7 @@ def bundle(tickers, horizon=5, paths=5000, bt_h=3, out="bundle.json"):
                            "sig_e": round(est["sigE"], 3), "rho": round(est["rho"], 2),
                            "m_pct": {str(k): round(v, 1) for k, v in est["m_pct"].items()},
                            "regime_z": est["regime_z"], "rerating": est["rerating"],
+                           "anchor_clamped": est["ou"].get("anchor_clamped", False),
                            "n_months": est["n_months"], "n_boots": len(est.get("boots") or [])},
                 "fan": {str(p): [round(v, 2) for v in sim["fan"][p]] for p in sim["fan"]},
                 "scen": {k: {"g": round(v["g"], 3), "m_exit": round(v["m_exit"], 1),
