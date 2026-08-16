@@ -33,16 +33,22 @@ re-rating regime detection (anchor blended toward the recent mean when the last
 3y sit >1σ from the long mean), and bootstrap parameter mixing so the fan
 carries estimation risk, not just shock risk.
 
-**Two earnings-drift modes:**
+**One earnings drift — a single prediction, no modes.** g(t) is an
+equal-weight blend of two legs:
 
-- **Base-rate** (default, backtested): g from the stock's own history; scenario
-  anchors = 25/50/75th percentiles of rolling-3y EPS CAGRs and of its own P/E
-  distribution.
-- **Consensus-anchored** (optional, *unvalidated*): years 1–2 from analyst
-  low/avg/high estimate chains (growth rates on Yahoo's basis applied to the
-  GAAP base — levels never mixed), fading to the historical quartiles for
-  years 3–5, bear terminal growth floored ≤0. Free data has no estimate
-  history, so this mode has no backtest; the UI says so wherever it appears.
+- **Street leg** (years 1–2, fading out): analyst low/avg/high estimate chains
+  (growth rates on Yahoo's basis applied to the GAAP base — levels never mixed
+  across bases), from Yahoo earningsTrend.
+- **History leg**: the stock's own rolling-3y EPS CAGR quartiles, with the
+  bear's leg floored at ≤0 so a benign sample cannot rule out contraction.
+
+Scenario anchors pair those growth chains with 25/50/75th-percentile exit
+multiples from the stock's own P/E history. Names without analyst coverage
+fall back to pure history — which is exactly the spine the walk-forward
+backtest grades; the Street tilt itself is *unvalidated* on free data
+(estimate history is paywalled) and every surface says so. The 50/50 weight is
+a robustness default, not an estimate — revisit it if estimate history is
+ever purchased.
 
 ## Data
 
@@ -96,7 +102,7 @@ per-ticker A/B/C grade in the Terminal encodes exactly this.
 - [x] Regime detection + anchor blending for re-rated names
 - [x] Split-basis guard (truncate at last split; as-filed EPS vs adjusted prices)
 - [x] Batch bundle mode + Terminal/Lab UI + on-demand cloud runs ([ANALYZE] queue)
-- [x] Consensus-anchored forward mode (unvalidated — see above)
+- [x] Street/history blended drift — one unified prediction (Street leg unvalidated, see above)
 - [ ] Dividend-aware forecast paths (currently only realized side is total-return)
 - [ ] Point-in-time estimate history (paid data) → validate forward mode, revisions signal
 - [ ] Qualitative layer: agent reads filings/transcripts for what the statistics can't see

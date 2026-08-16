@@ -24,12 +24,13 @@ Monte Carlo gives the fan; the walk-forward backtest scores both the central
 forecast (IC, hit rate) and the distribution (band coverage / PIT calibration)
 against GBM and constant-return baselines.
 
-Forward (consensus) mode: years 1-2 of the earnings process can be anchored to
-analyst consensus (Yahoo earningsTrend; growth rates on Yahoo's own basis
-applied to the GAAP eps_ttm base — levels are never mixed across bases), fading
-to the stock's historical quartile rates for years 3-5 with the bear terminal
-growth floored at <=0. UNVALIDATED: free data has no estimate history to
-backtest, so the reliability grade applies to base-rate mode only.
+Earnings drift (one model, no modes): an equal-weight blend of the Street
+chain (analyst low/avg/high consensus growth for years 1-2 — rates on Yahoo's
+own basis applied to the GAAP eps_ttm base, levels never mixed — fading to
+history after FY+1) and the stock's own historical quartile rate, with the
+bear's historical leg floored at <=0. Names without analyst coverage fall back
+to pure history, which is exactly the spine the walk-forward backtest grades;
+the Street tilt itself is unvalidated on free data and is labeled as such.
 
 Data: SEC EDGAR (free, stable, no key) + Yahoo chart API (free, no key).
 Cache: ./.cache (prices 1 day, fundamentals 1 day, ticker map 30 days).
@@ -435,21 +436,6 @@ def simulate(px0, eps0, m0, est, horizon_y, n_paths, g_override=None, seed=7):
     ann = sorted((v/px0)**(1/horizon_y) - 1 for v in term)
     return {"fan": fan, "terminal_px": sorted(term), "ann_returns": ann}
 
-def scenario_lines(eps0, m0, est, horizon_y):
-    """Deterministic anchors: EPS at g_x, multiple linearly -> its percentile."""
-    steps = int(horizon_y*12)
-    out = {}
-    for name, gp, mp in (("bear", "bear", 0.25), ("base", "base", 0.50), ("bull", "bull", 0.75)):
-        g = est["g"][gp]; m_t = est["m_pct"][mp]
-        pts = []
-        for t in range(1, steps+1):
-            f = t/steps
-            eps = eps0 * (1+g)**(t/12.0)
-            mult = m0 + (m_t - m0)*f
-            pts.append(eps*mult)
-        out[name] = {"g": g, "m_exit": m_t, "path": pts}
-    return out
-
 # ------------------------------------------------------- forward (consensus)
 
 def _fwd_growth_at(ty, g0, g1, t0, t1, term_g, horizon_y):
@@ -471,50 +457,60 @@ def _fwd_times(fwd, asof):
     t0 = max(0.0, t0)
     return (t0, t1) if t1 > t0 else None
 
-def fwd_scenario_lines(eps0, m0, est, fwd, horizon_y, asof):
-    """Consensus-anchored deterministic scenarios: analyst low/avg/high growth
-    chains (rates on Yahoo's own basis applied to the GAAP eps0) for FY0/FY1,
-    fading to the stock's historical quartile rates after — with the bear's
-    terminal growth floored at <=0 so a benign sample can't rule out
-    contraction. Exit multiples are the same own-history percentiles as the
-    base-rate mode: analysts forecast earnings, not what the market will pay.
-    UNVALIDATED: historical consensus is paywalled, so no backtest exists."""
-    tt = _fwd_times(fwd, asof)
-    if not tt:
-        return None
-    t0, t1 = tt
+BLEND_W = 0.5   # Street weight in the drift blend. Equal-weight because the
+                # relative skill of history vs consensus is unestimable without
+                # (paywalled) estimate history; revisit if that data is bought.
+
+def _blend_clip(x):
+    return None if x is None else min(max(x, EPS_CLIP[0]), EPS_CLIP[1])
+
+def unified_scenario_lines(eps0, m0, est, fwd, horizon_y, asof):
+    """THE scenario set — one model, no modes. Earnings drift per scenario is
+    an equal-weight blend of the Street chain (analyst low/avg/high growth
+    rates on Yahoo's own basis applied to the GAAP eps0, fading to history
+    after FY+1) and the stock's own historical quartile rate. The bear's
+    historical leg is floored at <=0 so a benign sample cannot rule out
+    contraction. Names without analyst coverage fall back to pure history —
+    which is exactly the spine the walk-forward backtest validates; the Street
+    tilt itself cannot be backtested on free data. Exit multiples are always
+    own-history percentiles: analysts forecast earnings, not what the market
+    will pay."""
+    tt = _fwd_times(fwd, asof) if fwd else None
     steps = int(horizon_y * 12)
-    clip = lambda x: None if x is None else min(max(x, EPS_CLIP[0]), EPS_CLIP[1])
     out = {}
-    for name, gk, mp, term_g in (
-            ("bear", "low", 0.25, min(est["g"]["bear"], 0.0)),
-            ("base", "avg", 0.50, est["g"]["base"]),
-            ("bull", "high", 0.75, est["g"]["bull"])):
-        g0, g1 = clip(fwd["g"]["fy0"][gk]), clip(fwd["g"]["fy1"][gk])
-        if g0 is None or g1 is None:
-            return None
+    for name, gk, mp in (("bear", "low", 0.25), ("base", "avg", 0.50),
+                         ("bull", "high", 0.75)):
+        h = est["g"][name]
+        h_leg = min(h, 0.0) if name == "bear" else h
+        c0 = c1 = None
+        if tt:
+            c0, c1 = _blend_clip(fwd["g"]["fy0"][gk]), _blend_clip(fwd["g"]["fy1"][gk])
         m_t = est["m_pct"][mp]
         pts, lnE = [], math.log(eps0)
         for t in range(1, steps + 1):
-            r = _fwd_growth_at(t / 12.0, g0, g1, t0, t1, term_g, horizon_y)
+            if c0 is not None and c1 is not None:
+                c = _fwd_growth_at(t / 12.0, c0, c1, tt[0], tt[1], h_leg, horizon_y)
+                r = BLEND_W * c + (1 - BLEND_W) * h_leg
+            else:
+                r = h
             lnE += math.log1p(r) / 12.0
             pts.append(math.exp(lnE) * (m0 + (m_t - m0) * t / steps))
         out[name] = {"g": (math.exp(lnE) / eps0) ** (1 / horizon_y) - 1,
                      "m_exit": m_t, "path": pts}
     return out
 
-def fwd_g_path(est, fwd, horizon_y, asof):
-    """Monthly drift array for simulate(): the base consensus chain."""
-    tt = _fwd_times(fwd, asof)
+def unified_g_path(est, fwd, horizon_y, asof):
+    """MC drift: scalar historical base rate, or the blended monthly array when
+    consensus exists (same blend as the base scenario line)."""
+    h = est["g"]["base"]
+    tt = _fwd_times(fwd, asof) if fwd else None
     if not tt:
-        return None
-    t0, t1 = tt
-    clip = lambda x: None if x is None else min(max(x, EPS_CLIP[0]), EPS_CLIP[1])
-    g0, g1 = clip(fwd["g"]["fy0"]["avg"]), clip(fwd["g"]["fy1"]["avg"])
-    if g0 is None or g1 is None:
-        return None
-    return [_fwd_growth_at(t / 12.0, g0, g1, t0, t1, est["g"]["base"], horizon_y)
-            for t in range(1, int(horizon_y * 12) + 1)]
+        return h
+    c0, c1 = _blend_clip(fwd["g"]["fy0"]["avg"]), _blend_clip(fwd["g"]["fy1"]["avg"])
+    if c0 is None or c1 is None:
+        return h
+    return [BLEND_W * _fwd_growth_at(t / 12.0, c0, c1, tt[0], tt[1], h, horizon_y)
+            + (1 - BLEND_W) * h for t in range(1, int(horizon_y * 12) + 1)]
 
 # ------------------------------------------------------------------- backtest
 
@@ -786,8 +782,10 @@ def run(ticker, horizon=5, paths=8000, bt_h=3, do_backtest=True):
     row = panel[-1]
     if not row["m"] or row["m"] <= 0:
         raise SystemExit("%s: negative trailing EPS — this engine prices compounders only" % ticker)
-    sim = simulate(row["px"], row["eps"], row["m"], est, horizon, paths)
-    scen = scenario_lines(row["eps"], row["m"], est, horizon)
+    fwd = forward_estimates(ticker)
+    sim = simulate(row["px"], row["eps"], row["m"], est, horizon, paths,
+                   g_override=unified_g_path(est, fwd, horizon, row["date"]))
+    scen = unified_scenario_lines(row["eps"], row["m"], est, fwd, horizon, row["date"])
     res, mets = [], {"note": "skipped"}
     if do_backtest:
         res = backtest(panel, bt_h)
@@ -806,23 +804,19 @@ def run(ticker, horizon=5, paths=8000, bt_h=3, do_backtest=True):
                "mc_p05": round(pctl(ann, 0.05), 3), "mc_p95": round(pctl(ann, 0.95), 3),
                "p_loss": round(sum(1 for r in ann if r < 0)/len(ann), 2),
                "backtest": mets, "report": out}
-    fwd = forward_estimates(ticker)
-    if fwd:
-        scen_f = fwd_scenario_lines(row["eps"], row["m"], est, fwd, horizon, row["date"])
-        gpath = fwd_g_path(est, fwd, horizon, row["date"])
-        if scen_f and gpath:
-            sim_f = simulate(row["px"], row["eps"], row["m"], est, horizon, paths,
-                             g_override=gpath, seed=13)
-            annf = sim_f["ann_returns"]
-            summary["forward"] = {
-                "note": "consensus-anchored (growth rates on Yahoo basis, GAAP base); UNVALIDATED — no backtest possible on free data",
-                "fy0_g": {k: (None if v is None else round(v, 3)) for k, v in fwd["g"]["fy0"].items()},
-                "fy1_g": {k: (None if v is None else round(v, 3)) for k, v in fwd["g"]["fy1"].items()},
-                "analysts": fwd["fy1"]["n"],
-                "rev_30d": [fwd["fy1"]["rev_up30"], fwd["fy1"]["rev_dn30"]],
-                "scen_g": {k: round(v["g"], 3) for k, v in scen_f.items()},
-                "mc_median_ann": round(pctl(annf, 0.5), 3),
-                "p_loss": round(sum(1 for r in annf if r < 0)/len(annf), 2)}
+    has_street = isinstance(unified_g_path(est, fwd, horizon, row["date"]), list)
+    summary["drift"] = {
+        "mode": ("blend: %.0f%% Street (yrs 1-2, fading) + %.0f%% own history"
+                 % (BLEND_W*100, (1-BLEND_W)*100)) if has_street
+                else "own history only (no analyst coverage)",
+        "note": "Street tilt is unvalidated (no free estimate history); the backtest grades the historical spine",
+        "scen_g": {k: round(v["g"], 3) for k, v in scen.items()}}
+    if has_street:
+        summary["drift"].update({
+            "fy0_g": {k: (None if v is None else round(v, 3)) for k, v in fwd["g"]["fy0"].items()},
+            "fy1_g": {k: (None if v is None else round(v, 3)) for k, v in fwd["g"]["fy1"].items()},
+            "analysts": fwd["fy1"]["n"],
+            "rev_30d": [fwd["fy1"]["rev_up30"], fwd["fy1"]["rev_dn30"]]})
     print(json.dumps(summary, indent=2))
     return summary
 
@@ -846,35 +840,20 @@ def bundle(tickers, horizon=5, paths=5000, bt_h=3, out="bundle.json"):
                 data["failed"][t.upper()] = reason
                 print("SKIP %s: %s" % (t, reason), file=sys.stderr)
                 continue
-            sim = simulate(row["px"], row["eps"], row["m"], est, horizon, paths)
-            scen = scenario_lines(row["eps"], row["m"], est, horizon)
             fwd = forward_estimates(t)
-            fwd_block = {"available": False}
-            if fwd:
-                scen_f = fwd_scenario_lines(row["eps"], row["m"], est, fwd, horizon, row["date"])
-                gpath = fwd_g_path(est, fwd, horizon, row["date"])
-                if scen_f and gpath:
-                    sim_f = simulate(row["px"], row["eps"], row["m"], est,
-                                     horizon, paths, g_override=gpath, seed=13)
-                    annf = sim_f["ann_returns"]
-                    est_rows = {}
-                    for k in ("fy0", "fy1"):
-                        r_, gg = fwd[k], fwd["g"][k]
-                        est_rows[k] = {"end": r_["end"], "n": r_["n"],
-                                       "rev_up30": r_["rev_up30"], "rev_dn30": r_["rev_dn30"],
-                                       "g_low": None if gg["low"] is None else round(gg["low"], 3),
-                                       "g_avg": None if gg["avg"] is None else round(gg["avg"], 3),
-                                       "g_high": None if gg["high"] is None else round(gg["high"], 3)}
-                    fwd_block = {
-                        "available": True, "fy0": est_rows["fy0"], "fy1": est_rows["fy1"],
-                        "fan": {str(p): [round(v, 2) for v in sim_f["fan"][p]] for p in sim_f["fan"]},
-                        "scen": {k: {"g": round(v["g"], 3), "m_exit": round(v["m_exit"], 1),
-                                     "path": [round(x, 2) for x in v["path"]]}
-                                 for k, v in scen_f.items()},
-                        "dist": {"p05": round(pctl(annf, .05), 3), "p25": round(pctl(annf, .25), 3),
-                                 "med": round(pctl(annf, .50), 3), "p75": round(pctl(annf, .75), 3),
-                                 "p95": round(pctl(annf, .95), 3),
-                                 "p_loss": round(sum(1 for r_ in annf if r_ < 0)/len(annf), 2)}}
+            gpath = unified_g_path(est, fwd, horizon, row["date"])
+            sim = simulate(row["px"], row["eps"], row["m"], est, horizon, paths,
+                           g_override=gpath)
+            scen = unified_scenario_lines(row["eps"], row["m"], est, fwd, horizon, row["date"])
+            drift = {"street": isinstance(gpath, list), "w_street": BLEND_W}
+            if drift["street"]:
+                for k in ("fy0", "fy1"):
+                    r_, gg = fwd[k], fwd["g"][k]
+                    drift[k] = {"end": r_["end"], "n": r_["n"],
+                                "rev_up30": r_["rev_up30"], "rev_dn30": r_["rev_dn30"],
+                                "g_low": None if gg["low"] is None else round(gg["low"], 3),
+                                "g_avg": None if gg["avg"] is None else round(gg["avg"], 3),
+                                "g_high": None if gg["high"] is None else round(gg["high"], 3)}
             res = backtest(panel, bt_h)
             mets = bt_metrics(res, bt_h)
             rets_now = [math.log(panel[j]["adj"]/panel[j-1]["adj"]) for j in range(1, len(panel))]
@@ -906,7 +885,7 @@ def bundle(tickers, horizon=5, paths=5000, bt_h=3, out="bundle.json"):
                          "med": round(pctl(ann, .50), 3), "p75": round(pctl(ann, .75), 3),
                          "p95": round(pctl(ann, .95), 3),
                          "p_loss": round(sum(1 for r in ann if r < 0)/len(ann), 2)},
-                "fwd": fwd_block,
+                "drift": drift,
                 "hist": hist, "mult": mult, "gbm_now": gbm_now,
                 "bt": {"points": [[r["date"], round(r["pred_med"], 3), round(r["pred_comb"], 3),
                                    round(r["realized"], 3)] for r in res],
