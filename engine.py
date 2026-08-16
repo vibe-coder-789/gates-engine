@@ -50,12 +50,28 @@ def _fetch(url, ttl_hours, tag):
     if os.path.exists(key) and (time.time() - os.path.getmtime(key)) < ttl_hours * 3600:
         with open(key) as f:
             return json.load(f)
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode())
+    # Retry with backoff: EDGAR's Akamai front-end intermittently 403s
+    # datacenter IPs; patience beats cleverness here.
+    data = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode())
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429, 503) and attempt < 3:
+                wait = 20 * (attempt + 1)
+                print("  rate-limited (%d) on %s — backoff %ds" % (e.code, tag, wait),
+                      file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
+    if data is None:
+        raise urllib.error.HTTPError(url, 403, "rate-limited after retries", None, None)
     with open(key, "w") as f:
         json.dump(data, f)
-    time.sleep(0.15)  # politeness (EDGAR fair-use)
+    time.sleep(0.3)  # politeness (EDGAR fair-use; gentler for datacenter IPs)
     return data
 
 def ticker_to_cik(ticker):
