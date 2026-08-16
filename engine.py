@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-gates-engine: fundamental-anchored stochastic price scenarios + walk-forward backtest.
+gates-engine v0.4 — a single-name stock price prediction model.
+
+Sole aim: given a ticker, produce an honest 5-year price distribution —
+fan chart, bear/base/bull scenario paths, and a per-ticker reliability grade
+from a walk-forward backtest. One model, one stock at a time, no factor zoo.
 
     python3 engine.py EME [--horizon 5] [--paths 8000] [--bt-h 3] [--no-backtest]
 
@@ -20,6 +24,13 @@ Monte Carlo gives the fan; the walk-forward backtest scores both the central
 forecast (IC, hit rate) and the distribution (band coverage / PIT calibration)
 against GBM and constant-return baselines.
 
+Forward (consensus) mode: years 1-2 of the earnings process can be anchored to
+analyst consensus (Yahoo earningsTrend; growth rates on Yahoo's own basis
+applied to the GAAP eps_ttm base — levels are never mixed across bases), fading
+to the stock's historical quartile rates for years 3-5 with the bear terminal
+growth floored at <=0. UNVALIDATED: free data has no estimate history to
+backtest, so the reliability grade applies to base-rate mode only.
+
 Data: SEC EDGAR (free, stable, no key) + Yahoo chart API (free, no key).
 Cache: ./.cache (prices 1 day, fundamentals 1 day, ticker map 30 days).
 
@@ -35,7 +46,7 @@ HONESTY NOTES (also printed in reports):
 import json, math, os, random, statistics, sys, time, urllib.parse, urllib.request
 from datetime import date, datetime, timedelta
 
-UA = {"User-Agent": os.environ.get("GATES_CONTACT", "gates-engine/0.2 (github.com/vibe-coder-789/gates-engine)")}
+UA = {"User-Agent": os.environ.get("GATES_CONTACT", "gates-engine/0.4 (github.com/vibe-coder-789/gates-engine)")}
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 REPORTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 PUB_LAG_DAYS = 45          # EPS for a quarter assumed known 45d after quarter end

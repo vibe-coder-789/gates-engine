@@ -1,7 +1,9 @@
 # gates-engine
 
-Fundamental-anchored stochastic price-scenario model with walk-forward backtesting.
-Companion to the Five Gates framework / Watts-to-Tokens series.
+**A single-name stock price prediction model.** Given a ticker, it produces an
+honest 5-year price distribution: a Monte-Carlo fan, bear/base/bull scenario
+paths, and a per-ticker reliability grade from a walk-forward backtest.
+One model, one stock at a time — no factor zoo.
 
 ## Usage
 
@@ -9,6 +11,7 @@ Companion to the Five Gates framework / Watts-to-Tokens series.
 python3 engine.py EME                 # full run: fetch → fit → simulate → backtest → report
 python3 engine.py WMB --no-backtest   # faster, skips walk-forward
 python3 engine.py MU --horizon=5 --paths=8000 --bt-h=3
+python3 engine.py bundle EME MSFT AAPL --out=bundle.json   # batch → Terminal/Lab UI
 open reports/eme.html                 # styled report with fan chart + backtest
 ```
 
@@ -18,24 +21,38 @@ Stdlib-only (no pip installs). Data cached in `.cache/` (1 day).
 
 ```
 ln P_t = ln EPS_ttm(t) + ln M_t
-d lnE  = g dt + σ_E dW₁                     (earnings: drift + shocks)
+d lnE  = g(t) dt + σ_E dW₁                  (earnings: drift + shocks)
 d lnM  = κ(ln M̄ − lnM) dt + σ_M dW₂        (multiple: Ornstein–Uhlenbeck)
 corr(dW₁, dW₂) = ρ                          (estimated; usually ≤ 0)
 ```
 
-All parameters estimated per ticker from its own history. Scenario anchors
-(bear/base/bull) = 25/50/75th percentiles of the stock's rolling-3y EPS CAGR
-distribution and of its own historical P/E distribution. Monte Carlo (8k paths)
-produces the fan; deterministic anchors overlay it.
+All parameters estimated per ticker from its own history, with guards learned
+the hard way: split-basis truncation (as-filed EPS vs adjusted prices), 3–75×
+multiple hygiene + winsorizing, near-unit-root anchor clamping, σ_M capping,
+re-rating regime detection (anchor blended toward the recent mean when the last
+3y sit >1σ from the long mean), and bootstrap parameter mixing so the fan
+carries estimation risk, not just shock risk.
+
+**Two earnings-drift modes:**
+
+- **Base-rate** (default, backtested): g from the stock's own history; scenario
+  anchors = 25/50/75th percentiles of rolling-3y EPS CAGRs and of its own P/E
+  distribution.
+- **Consensus-anchored** (optional, *unvalidated*): years 1–2 from analyst
+  low/avg/high estimate chains (growth rates on Yahoo's basis applied to the
+  GAAP base — levels never mixed), fading to the historical quartiles for
+  years 3–5, bear terminal growth floored ≤0. Free data has no estimate
+  history, so this mode has no backtest; the UI says so wherever it appears.
 
 ## Data
 
-- **SEC EDGAR XBRL** (`companyconcept`, free, no key): diluted EPS by quarter,
-  fiscal-year-safe (quarterly = 80–100-day durations; fiscal Q4 synthesized as
-  FY − interior quarters). 45-day publication lag applied so the backtest never
-  uses numbers before the market had them.
+- **SEC EDGAR XBRL** (free, no key): diluted GAAP EPS by quarter,
+  fiscal-year-safe (duration-based extraction; fiscal Q4 synthesized as
+  FY − interior quarters), 45-day publication lag against lookahead.
 - **Yahoo chart API** (free, no key): 25y monthly closes + adjusted closes
-  (realized backtest returns are total-return via adjclose).
+  (realized backtest returns are total-return), split dates.
+- **Yahoo earningsTrend** (free, cookie+crumb): analyst consensus EPS
+  estimates + 30-day revision counts, for forward mode.
 
 ## Backtest protocol
 
@@ -43,9 +60,10 @@ Walk-forward, monthly origins, minimum 48 months of history, **past-only fits**
 at every origin. Scored on: Pearson/Spearman IC of predicted-median vs realized
 3-yr annualized return; MAE; sign hit-rate vs a 6% threshold; and distribution
 calibration (coverage of the 50% and 90% predicted bands). Baselines: GBM with
-trailing moments, and a constant-8% forecast.
+trailing moments, and a constant-8% forecast. Overlapping origins mean
+effective n ≈ n/(12·H): ICs are descriptive, not significant.
 
-## Honest results (Aug 2026, 3 tickers)
+## Honest results (Aug 2026)
 
 | | EME (stable compounder) | WMB (yieldco) | MU (cyclical) |
 |---|---|---|---|
@@ -56,18 +74,31 @@ trailing moments, and a constant-8% forecast.
 
 **Interpretation:** the mean-reversion model adds value only for stable-multiple
 compounders; for re-raters and cyclicals it is *worse than baselines* — multiple
-reversion systematically fades regime changes. Calibration is regime-dependent
-(EME's re-rating blew through the bands; WMB/MU bands are conservatively wide).
-The model's honest use is as a *scenario framer and expectations translator*,
-not a return predictor. Overlapping origins mean effective n ≈ 2–3 per ticker:
-all ICs are descriptive, not significant.
+reversion systematically fades regime changes. The model's honest use is as a
+*scenario framer and expectations translator*, not a return predictor. The
+per-ticker A/B/C grade in the Terminal encodes exactly this.
+
+## Retired experiments
+
+- **Cross-sectional factor layer** (v0.3, `xsection.py`, removed): monthly
+  VALUE/MOM/GROWTH/LOWVOL/REVGAP ranking over a 272-name large-cap universe,
+  2012–2026. Result: no factor achieved |t| > 1.1; the composite long-short
+  lost 6.8%/yr gross while the equal-weight market made 16.5%/yr — and fixing
+  the split-basis contamination made the factors *worse*, proving the little
+  apparent signal was partly a data bug. A clean negative: these signals carry
+  no cross-sectional edge in recent large-cap US data, so the ranking machine
+  was cut and the project refocused on single-name prediction. (Reproducible
+  from git history.)
 
 ## Roadmap
 
-- [ ] Parameter-uncertainty widening (bootstrap the OU fit into the bands)
+- [x] Parameter-uncertainty widening (bootstrap OU refits mixed into the fan)
+- [x] Regime detection + anchor blending for re-rated names
+- [x] Split-basis guard (truncate at last split; as-filed EPS vs adjusted prices)
+- [x] Batch bundle mode + Terminal/Lab UI + on-demand cloud runs ([ANALYZE] queue)
+- [x] Consensus-anchored forward mode (unvalidated — see above)
 - [ ] Dividend-aware forecast paths (currently only realized side is total-return)
-- [ ] Regime detection: flag non-stationary multiples, switch to wide-uncertainty mode
-- [ ] Batch mode over a watchlist + email delivery via the existing routine webhook
-- [ ] On-demand cloud runs (git-clone this repo in a scheduled Claude routine)
+- [ ] Point-in-time estimate history (paid data) → validate forward mode, revisions signal
+- [ ] Qualitative layer: agent reads filings/transcripts for what the statistics can't see
 
 *Not investment advice. Free-data quirks possible; verify against filings.*

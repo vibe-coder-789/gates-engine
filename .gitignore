@@ -4,3 +4,4 @@ bundle.json
 *.html
 *.b64gz
 __pycache__/
+experiments/
