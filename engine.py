@@ -32,7 +32,7 @@ HONESTY NOTES (also printed in reports):
 - Not investment advice. Point-in-time fundamentals only as good as XBRL frames.
 """
 
-import json, math, os, random, statistics, sys, time, urllib.request
+import json, math, os, random, statistics, sys, time, urllib.parse, urllib.request
 from datetime import date, datetime, timedelta
 
 UA = {"User-Agent": os.environ.get("GATES_CONTACT", "gates-engine/0.2 (github.com/vibe-coder-789/gates-engine)")}
@@ -140,6 +140,77 @@ def last_split_date(ticker):
         return None
     ts = max(int(v["date"]) for v in ev.values())
     return datetime.utcfromtimestamp(ts).date()
+
+def forward_estimates(ticker):
+    """Analyst consensus EPS estimates (Yahoo earningsTrend; cookie+crumb).
+    Cached 24h. Yahoo estimates are typically non-GAAP, so callers must use the
+    GROWTH RATES (vs Yahoo's own year-ago actual), never the levels, applied to
+    the GAAP eps_ttm base. Returns None whenever estimates are unavailable —
+    forward mode is strictly optional."""
+    os.makedirs(CACHE, exist_ok=True)
+    key = os.path.join(CACHE, ticker.lower() + "_fwd.json")
+    data = None
+    if os.path.exists(key) and (time.time() - os.path.getmtime(key)) < 24 * 3600:
+        with open(key) as f:
+            data = json.load(f)
+    else:
+        try:
+            import http.cookiejar
+            jar = http.cookiejar.CookieJar()
+            op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+            op.addheaders = [("User-Agent",
+                              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")]
+            try:
+                op.open("https://fc.yahoo.com", timeout=20).read()
+            except Exception:
+                pass                                   # 404s but sets the cookie
+            crumb = op.open("https://query1.finance.yahoo.com/v1/test/getcrumb",
+                            timeout=20).read().decode().strip()
+            if not crumb or "<" in crumb:
+                return None
+            url = ("https://query1.finance.yahoo.com/v10/finance/quoteSummary/%s"
+                   "?modules=earningsTrend&crumb=%s"
+                   % (ticker.upper(), urllib.parse.quote(crumb)))
+            data = json.loads(op.open(url, timeout=30).read().decode())
+            with open(key, "w") as f:
+                json.dump(data, f)
+            time.sleep(0.3)
+        except Exception:
+            return None
+    try:
+        trend = data["quoteSummary"]["result"][0]["earningsTrend"]["trend"]
+    except (KeyError, TypeError, IndexError):
+        return None
+    raw = lambda x: (x or {}).get("raw")
+    per = {t.get("period"): t for t in trend}
+    out = {}
+    for pk, name in (("0y", "fy0"), ("+1y", "fy1")):
+        t = per.get(pk)
+        if not t:
+            return None
+        ee = t.get("earningsEstimate") or {}
+        rv = t.get("epsRevisions") or {}
+        row = {"end": t.get("endDate"), "avg": raw(ee.get("avg")),
+               "low": raw(ee.get("low")), "high": raw(ee.get("high")),
+               "n": raw(ee.get("numberOfAnalysts")),
+               "year_ago": raw(ee.get("yearAgoEps")),
+               "rev_up30": raw(rv.get("upLast30days")),
+               "rev_dn30": raw(rv.get("downLast30days"))}
+        if not row["avg"] or not row["end"]:
+            return None
+        out[name] = row
+    base = out["fy0"]["year_ago"]
+    a0 = out["fy0"]["avg"]
+    if not base or base <= 0 or a0 <= 0:
+        return None                    # growth undefined off a <=0 base year
+    g = lambda num, den: (num / den - 1) if (num and den and den > 0) else None
+    # bear/bull chain low-on-low / high-on-high: cumulative = lowFY1/yrAgo etc.
+    out["g"] = {"fy0": {"avg": g(a0, base), "low": g(out["fy0"]["low"], base),
+                        "high": g(out["fy0"]["high"], base)},
+                "fy1": {"avg": g(out["fy1"]["avg"], a0),
+                        "low": g(out["fy1"]["low"], out["fy0"]["low"] or a0),
+                        "high": g(out["fy1"]["high"], out["fy0"]["high"] or a0)}}
+    return out
 
 def monthly_prices(ticker):
     """[(date, close, adjclose)] month bars from Yahoo; drops current partial month."""
@@ -312,11 +383,14 @@ def estimate(panel):
 # ----------------------------------------------------------------- simulation
 
 def simulate(px0, eps0, m0, est, horizon_y, n_paths, g_override=None, seed=7):
-    """Monte Carlo fan. Returns monthly percentile curves + terminal returns."""
+    """Monte Carlo fan. Returns monthly percentile curves + terminal returns.
+    g_override may be a scalar annual drift or a per-month list (forward mode:
+    consensus-implied drift fading to the historical base rate)."""
     rng = random.Random(seed)
     steps = int(horizon_y * 12)
     ou = est["ou"]
     g = est["g"]["base"] if g_override is None else g_override
+    g_arr = list(g) if isinstance(g, (list, tuple)) else [g] * steps
     dt = 1/12.0
     boots = est.get("boots") or []
     sE_m = est["sigE"] * math.sqrt(dt)
@@ -342,7 +416,7 @@ def simulate(px0, eps0, m0, est, horizon_y, n_paths, g_override=None, seed=7):
         for t in range(steps):
             z1 = rng.gauss(0, 1)
             z2 = rho*z1 + math.sqrt(max(0.0, 1-rho*rho))*rng.gauss(0, 1)
-            lnE += g*dt + sE_m*z1
+            lnE += g_arr[t]*dt + sE_m*z1
             lnM = lnbar + (lnM - lnbar)*e_k + tr_sd*z2
             curves[t].append(math.exp(lnE + lnM))
         term.append(curves[-1][-1])
@@ -364,6 +438,72 @@ def scenario_lines(eps0, m0, est, horizon_y):
             pts.append(eps*mult)
         out[name] = {"g": g, "m_exit": m_t, "path": pts}
     return out
+
+# ------------------------------------------------------- forward (consensus)
+
+def _fwd_growth_at(ty, g0, g1, t0, t1, term_g, horizon_y):
+    """Annual growth rate at year-fraction ty: FY0 rate to t0, FY1 rate to t1,
+    then linear fade from the FY1 rate to the terminal (historical) rate."""
+    if ty <= t0:
+        return g0
+    if ty <= t1:
+        return g1
+    w = min(1.0, (ty - t1) / max(1e-9, horizon_y - t1))
+    return (1 - w) * g1 + w * term_g
+
+def _fwd_times(fwd, asof):
+    yfrac = lambda iso: (date.fromisoformat(iso) - asof).days / 365.25
+    try:
+        t0, t1 = yfrac(fwd["fy0"]["end"]), yfrac(fwd["fy1"]["end"])
+    except (ValueError, TypeError, KeyError):
+        return None
+    t0 = max(0.0, t0)
+    return (t0, t1) if t1 > t0 else None
+
+def fwd_scenario_lines(eps0, m0, est, fwd, horizon_y, asof):
+    """Consensus-anchored deterministic scenarios: analyst low/avg/high growth
+    chains (rates on Yahoo's own basis applied to the GAAP eps0) for FY0/FY1,
+    fading to the stock's historical quartile rates after — with the bear's
+    terminal growth floored at <=0 so a benign sample can't rule out
+    contraction. Exit multiples are the same own-history percentiles as the
+    base-rate mode: analysts forecast earnings, not what the market will pay.
+    UNVALIDATED: historical consensus is paywalled, so no backtest exists."""
+    tt = _fwd_times(fwd, asof)
+    if not tt:
+        return None
+    t0, t1 = tt
+    steps = int(horizon_y * 12)
+    clip = lambda x: None if x is None else min(max(x, EPS_CLIP[0]), EPS_CLIP[1])
+    out = {}
+    for name, gk, mp, term_g in (
+            ("bear", "low", 0.25, min(est["g"]["bear"], 0.0)),
+            ("base", "avg", 0.50, est["g"]["base"]),
+            ("bull", "high", 0.75, est["g"]["bull"])):
+        g0, g1 = clip(fwd["g"]["fy0"][gk]), clip(fwd["g"]["fy1"][gk])
+        if g0 is None or g1 is None:
+            return None
+        m_t = est["m_pct"][mp]
+        pts, lnE = [], math.log(eps0)
+        for t in range(1, steps + 1):
+            r = _fwd_growth_at(t / 12.0, g0, g1, t0, t1, term_g, horizon_y)
+            lnE += math.log1p(r) / 12.0
+            pts.append(math.exp(lnE) * (m0 + (m_t - m0) * t / steps))
+        out[name] = {"g": (math.exp(lnE) / eps0) ** (1 / horizon_y) - 1,
+                     "m_exit": m_t, "path": pts}
+    return out
+
+def fwd_g_path(est, fwd, horizon_y, asof):
+    """Monthly drift array for simulate(): the base consensus chain."""
+    tt = _fwd_times(fwd, asof)
+    if not tt:
+        return None
+    t0, t1 = tt
+    clip = lambda x: None if x is None else min(max(x, EPS_CLIP[0]), EPS_CLIP[1])
+    g0, g1 = clip(fwd["g"]["fy0"]["avg"]), clip(fwd["g"]["fy1"]["avg"])
+    if g0 is None or g1 is None:
+        return None
+    return [_fwd_growth_at(t / 12.0, g0, g1, t0, t1, est["g"]["base"], horizon_y)
+            for t in range(1, int(horizon_y * 12) + 1)]
 
 # ------------------------------------------------------------------- backtest
 
@@ -655,6 +795,23 @@ def run(ticker, horizon=5, paths=8000, bt_h=3, do_backtest=True):
                "mc_p05": round(pctl(ann, 0.05), 3), "mc_p95": round(pctl(ann, 0.95), 3),
                "p_loss": round(sum(1 for r in ann if r < 0)/len(ann), 2),
                "backtest": mets, "report": out}
+    fwd = forward_estimates(ticker)
+    if fwd:
+        scen_f = fwd_scenario_lines(row["eps"], row["m"], est, fwd, horizon, row["date"])
+        gpath = fwd_g_path(est, fwd, horizon, row["date"])
+        if scen_f and gpath:
+            sim_f = simulate(row["px"], row["eps"], row["m"], est, horizon, paths,
+                             g_override=gpath, seed=13)
+            annf = sim_f["ann_returns"]
+            summary["forward"] = {
+                "note": "consensus-anchored (growth rates on Yahoo basis, GAAP base); UNVALIDATED — no backtest possible on free data",
+                "fy0_g": {k: (None if v is None else round(v, 3)) for k, v in fwd["g"]["fy0"].items()},
+                "fy1_g": {k: (None if v is None else round(v, 3)) for k, v in fwd["g"]["fy1"].items()},
+                "analysts": fwd["fy1"]["n"],
+                "rev_30d": [fwd["fy1"]["rev_up30"], fwd["fy1"]["rev_dn30"]],
+                "scen_g": {k: round(v["g"], 3) for k, v in scen_f.items()},
+                "mc_median_ann": round(pctl(annf, 0.5), 3),
+                "p_loss": round(sum(1 for r in annf if r < 0)/len(annf), 2)}
     print(json.dumps(summary, indent=2))
     return summary
 
@@ -680,6 +837,33 @@ def bundle(tickers, horizon=5, paths=5000, bt_h=3, out="bundle.json"):
                 continue
             sim = simulate(row["px"], row["eps"], row["m"], est, horizon, paths)
             scen = scenario_lines(row["eps"], row["m"], est, horizon)
+            fwd = forward_estimates(t)
+            fwd_block = {"available": False}
+            if fwd:
+                scen_f = fwd_scenario_lines(row["eps"], row["m"], est, fwd, horizon, row["date"])
+                gpath = fwd_g_path(est, fwd, horizon, row["date"])
+                if scen_f and gpath:
+                    sim_f = simulate(row["px"], row["eps"], row["m"], est,
+                                     horizon, paths, g_override=gpath, seed=13)
+                    annf = sim_f["ann_returns"]
+                    est_rows = {}
+                    for k in ("fy0", "fy1"):
+                        r_, gg = fwd[k], fwd["g"][k]
+                        est_rows[k] = {"end": r_["end"], "n": r_["n"],
+                                       "rev_up30": r_["rev_up30"], "rev_dn30": r_["rev_dn30"],
+                                       "g_low": None if gg["low"] is None else round(gg["low"], 3),
+                                       "g_avg": None if gg["avg"] is None else round(gg["avg"], 3),
+                                       "g_high": None if gg["high"] is None else round(gg["high"], 3)}
+                    fwd_block = {
+                        "available": True, "fy0": est_rows["fy0"], "fy1": est_rows["fy1"],
+                        "fan": {str(p): [round(v, 2) for v in sim_f["fan"][p]] for p in sim_f["fan"]},
+                        "scen": {k: {"g": round(v["g"], 3), "m_exit": round(v["m_exit"], 1),
+                                     "path": [round(x, 2) for x in v["path"]]}
+                                 for k, v in scen_f.items()},
+                        "dist": {"p05": round(pctl(annf, .05), 3), "p25": round(pctl(annf, .25), 3),
+                                 "med": round(pctl(annf, .50), 3), "p75": round(pctl(annf, .75), 3),
+                                 "p95": round(pctl(annf, .95), 3),
+                                 "p_loss": round(sum(1 for r_ in annf if r_ < 0)/len(annf), 2)}}
             res = backtest(panel, bt_h)
             mets = bt_metrics(res, bt_h)
             rets_now = [math.log(panel[j]["adj"]/panel[j-1]["adj"]) for j in range(1, len(panel))]
@@ -711,6 +895,7 @@ def bundle(tickers, horizon=5, paths=5000, bt_h=3, out="bundle.json"):
                          "med": round(pctl(ann, .50), 3), "p75": round(pctl(ann, .75), 3),
                          "p95": round(pctl(ann, .95), 3),
                          "p_loss": round(sum(1 for r in ann if r < 0)/len(ann), 2)},
+                "fwd": fwd_block,
                 "hist": hist, "mult": mult, "gbm_now": gbm_now,
                 "bt": {"points": [[r["date"], round(r["pred_med"], 3), round(r["pred_comb"], 3),
                                    round(r["realized"], 3)] for r in res],
