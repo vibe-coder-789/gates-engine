@@ -28,6 +28,11 @@ HONESTY, PROMINENTLY:
 - Gross figures ignore costs until the stated cost line; shorting is
   modeled naively (no borrow costs/constraints).
 - GAAP EPS basis; ~monthly rebalance; no risk model beyond equal weight.
+- SPLIT-BASIS GUARD: Yahoo prices are retroactively split-adjusted but EDGAR
+  EPS is as-filed, so for months before a name's most recent stock split the
+  E/P-family factors would be garbage. EPS is masked (None) for those months:
+  VALUE/GROWTH/REVGAP skip them, while MOM/LOWVOL (adjusted-return based,
+  basis-safe) keep the full history.
 """
 
 import json, math, os, statistics, sys
@@ -73,11 +78,23 @@ def load_universe(verbose=True):
         try:
             cik, _ = engine.ticker_to_cik(t)
             eps_q = engine.quarterly_eps(cik, t)
-            panel = engine.build_panel(engine.monthly_prices(t), eps_q, {})
+            prices = engine.monthly_prices(t)
+            panel = engine.build_panel(prices, eps_q, {})
             if len(panel) < PUB_LAG_OK_MIN_MONTHS:
                 failed.append((t, "short"))
                 continue
-            data[t] = {month_key(r["date"]): (r["px"], r["adj"], r["eps"]) for r in panel}
+            # split-basis guard: EPS is valid only for months whose whole TTM
+            # window sits after the last split (see module docstring)
+            lsd = engine.last_split_date(t)
+            if lsd is None:
+                eps_ok = None                            # all months fine
+            else:
+                clean = engine.build_panel(prices, eps_q, {}, min_q_end=lsd)
+                eps_ok = {month_key(r["date"]) for r in clean}
+            data[t] = {month_key(r["date"]):
+                       (r["px"], r["adj"],
+                        r["eps"] if eps_ok is None or month_key(r["date"]) in eps_ok else None)
+                       for r in panel}
         except SystemExit as e:
             failed.append((t, str(e)[:40]))
         except Exception as e:
@@ -123,17 +140,19 @@ def compute_month(data, mk):
         adjs = [h[1] for h in hist]                      # adj[mk-k], k=0..12
         rets12 = [adjs[k] / adjs[k + 1] - 1 for k in range(12)]
         f = {}
-        f["VALUE"] = eps / px                            # can be negative: fine
+        if eps is not None:
+            f["VALUE"] = eps / px                        # can be negative: fine
         f["MOM"] = adjs[1] / adjs[12] - 1                # t-12 .. t-1
         prior = series.get(mk - 12)
-        if prior and prior[2] > 0 and eps > 0:
+        if eps is not None and eps > 0 and prior and prior[2] is not None and prior[2] > 0:
             f["GROWTH"] = max(-1.0, min(1.0, math.log(eps / prior[2])))
         f["LOWVOL"] = -statistics.pstdev(rets12)
         # expanding median multiple (>=36 obs) for the reversion gap
         past_m = [series[k2][0] / series[k2][2]
-                  for k2 in series if k2 <= mk and series[k2][2] > 0
+                  for k2 in series if k2 <= mk and series[k2][2] is not None
+                  and series[k2][2] > 0
                   and 3 <= series[k2][0] / series[k2][2] <= 75]
-        if len(past_m) >= 36 and eps > 0 and 3 <= px / eps <= 75:
+        if len(past_m) >= 36 and eps is not None and eps > 0 and 3 <= px / eps <= 75:
             med = sorted(past_m)[len(past_m) // 2]
             f["REVGAP"] = math.log(med) - math.log(px / eps)
         rows[t] = {"f": f, "fwd": nxt[1] / adj - 1}
@@ -291,7 +310,7 @@ tr:last-child td{border-bottom:none}
 <div class="card"><b>Monthly cross-sectional Spearman IC</b> (t-stats are legitimate here: months don't overlap)
 <table><tr><th>factor</th><th>mean IC</th><th>t-stat</th><th>hit rate</th><th>months</th></tr>%s</table>
 <p class="note">|t| &gt; 2 &asymp; conventionally significant. Composite = equal-weight z of available factors. REVGAP is the single-name OU signal cross-sectionalized.</p></div>
-<p class="note">gates-engine v0.3 &middot; data: SEC EDGAR XBRL + Yahoo, 45-day pub lag &middot; GAAP EPS &middot; not investment advice &middot; costs modeled naively at 20bps one-way.</p>
+<p class="note">gates-engine v0.3 &middot; data: SEC EDGAR XBRL + Yahoo, 45-day pub lag &middot; GAAP EPS &middot; split-basis guard: E/P-family factors skip months whose TTM EPS predates a name's last stock split &middot; not investment advice &middot; costs modeled naively at 20bps one-way.</p>
 </div>""" % (out["as_of"], out["universe"], out["loaded"], out["start"], out["months"],
              out["warning"], W, H, gy, xt, pts,
              q["ann_gross"] * 100, q["vol"] * 100, q["sharpe_gross"], q["max_dd"] * 100,
