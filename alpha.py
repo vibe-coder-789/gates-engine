@@ -15,8 +15,13 @@ judgment can be scored later (counterfactual: what the vetoed entry would
 have returned). The veto node has asymmetric authority: it can only block
 entries, never initiate trades, touch exits, or enlarge positions.
 
+--universe: a screener-produced universe.json ({"tickers": [...]}) replaces
+the built-in fallback list — discovery is mechanical (see screener.py) and
+refreshed monthly by the Universe Scout routine.
+
 STRATEGY (fixed; changing it means committing a new version):
-- Universe: ~60 liquid US large caps (below), whoever has >=140 daily bars.
+- Universe: the screener's ~150 most liquid US names (fallback: the built-in
+  list below), whoever has >=140 daily bars.
 - Signals (close-to-close daily bars, z-scored, winsorized +-3):
     STR   5-day return, weight -1.0      (short-term reversal: buy dips)
     MOM   126d return skipping last 21d, weight +0.5
@@ -90,8 +95,9 @@ def zmap(vals):
     return {k: max(-3.0, min(3.0, (v - mu) / sd)) for k, v in vals.items()}
 
 
-def compute_scores(signals):
+def compute_scores(signals, universe=None):
     """{ticker: {score, px, r5, mom}} for the tradable universe today."""
+    universe = universe or UNIVERSE
     veto = set()
     if signals:
         for t, s in signals.get("tickers", {}).items():
@@ -100,7 +106,7 @@ def compute_scores(signals):
     import datetime as _dt
     today_utc = _dt.datetime.utcnow().date()
     raw = {}
-    for t in UNIVERSE:
+    for t in universe:
         if t in veto:
             continue
         bars = daily_closes(t)
@@ -125,10 +131,10 @@ def compute_scores(signals):
     return out
 
 
-def run(state, signals, vetoes=None):
+def run(state, signals, vetoes=None, universe=None):
     vetoes = vetoes or {}
     today = date.today().isoformat()
-    scores = compute_scores(signals)
+    scores = compute_scores(signals, universe=universe)
     if len(scores) < 30:
         return {"state": state, "trades": [],
                 "valuation": {"date": today, "error": "only %d names scored — data problem, no trades" % len(scores)}}
@@ -238,8 +244,18 @@ if __name__ == "__main__":
                 vetoes = {k.upper(): v for k, v in json.load(f).items()}
         except Exception:
             vetoes = {}
+    universe = None
+    if "--universe" in flags:
+        try:
+            with open(flags["--universe"]) as f:
+                u = json.load(f).get("tickers")
+            if u and len(u) >= 40:            # sanity floor: refuse a broken file
+                universe = [t.upper() for t in u]
+        except Exception:
+            universe = None                    # fall back to built-in list
     dry = bool(flags.get("--dry-run"))
-    out = run(copy.deepcopy(state) if dry else state, signals, vetoes=vetoes)
+    out = run(copy.deepcopy(state) if dry else state, signals, vetoes=vetoes,
+              universe=universe)
     if "--out" in flags and not dry:
         with open(flags["--out"], "w") as f:
             json.dump(out["state"], f, indent=1)
