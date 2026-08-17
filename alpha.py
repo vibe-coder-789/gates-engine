@@ -131,7 +131,7 @@ def compute_scores(signals, universe=None):
     return out
 
 
-def run(state, signals, vetoes=None, universe=None):
+def run(state, signals, vetoes=None, universe=None, earnings=None):
     vetoes = vetoes or {}
     today = date.today().isoformat()
     scores = compute_scores(signals, universe=universe)
@@ -175,11 +175,34 @@ def run(state, signals, vetoes=None, universe=None):
     # entries: fill empty slots with best-ranked names not held
     slots = 0 if halted else (TOP_N - len(state["positions"]))
     v = port_value()
+    # mechanical earnings veto: the screener's universe file carries each
+    # name's earnings date (which may be the LAST report — only a FUTURE date
+    # within the next 3 calendar days blocks entry). Deterministic; the LLM
+    # veto node handles only the fuzzy events.
+    def earnings_block(t):
+        ed = (earnings or {}).get(t.upper())
+        if not ed:
+            return None
+        import datetime as _dt
+        try:
+            d0 = _dt.datetime.strptime(ed.split()[0], "%m/%d/%Y").date()
+        except ValueError:
+            return None
+        delta = (d0 - date.today()).days
+        if 0 <= delta <= 3:
+            return "earnings scheduled %s (mechanical check)" % ed.split()[0]
+        return None
+
     vetoed_today = []
     for t in ranked:
         if slots <= 0:
             break
         if t in state["positions"]:
+            continue
+        eb = earnings_block(t)
+        if eb:
+            vetoed_today.append({"date": today, "ticker": t, "px": round(px[t], 2),
+                                 "reason": eb})
             continue
         if t.upper() in vetoes:
             vetoed_today.append({"date": today, "ticker": t, "px": round(px[t], 2),
@@ -244,18 +267,20 @@ if __name__ == "__main__":
                 vetoes = {k.upper(): v for k, v in json.load(f).items()}
         except Exception:
             vetoes = {}
-    universe = None
+    universe, earnings = None, None
     if "--universe" in flags:
         try:
             with open(flags["--universe"]) as f:
-                u = json.load(f).get("tickers")
+                ufile = json.load(f)
+            u = ufile.get("tickers")
             if u and len(u) >= 40:            # sanity floor: refuse a broken file
                 universe = [t.upper() for t in u]
+            earnings = ufile.get("earnings") or {}
         except Exception:
             universe = None                    # fall back to built-in list
     dry = bool(flags.get("--dry-run"))
     out = run(copy.deepcopy(state) if dry else state, signals, vetoes=vetoes,
-              universe=universe)
+              universe=universe, earnings=earnings)
     if "--out" in flags and not dry:
         with open(flags["--out"], "w") as f:
             json.dump(out["state"], f, indent=1)

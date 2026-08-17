@@ -23,13 +23,72 @@ Discovery is mechanical; the earnings-model veto and the LLM event veto still
 apply downstream at trade time.
 """
 
-import json, re, statistics, sys, time, urllib.request
+import csv, io, json, os, re, statistics, sys, time, urllib.request
 from datetime import date
 
 UA = {"User-Agent": "gates-screener/1.0 (github.com/vibe-coder-789/gates-engine)"}
 MIN_DOLLAR_VOL = 50e6
 MIN_PRICE = 5.0
 MIN_BARS = 55
+
+
+def finviz_token():
+    """FINVIZ_AUTH env var, else a local .finviz file (gitignored). None = no
+    Elite access; the Yahoo pipeline below is the fallback."""
+    tok = os.environ.get("FINVIZ_AUTH", "").strip()
+    if tok:
+        return tok
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".finviz")
+    if os.path.exists(p):
+        with open(p) as f:
+            return f.read().strip() or None
+    return None
+
+
+def finviz_universe(size, token):
+    """One authenticated Finviz Elite export replaces ~500 Yahoo fetches:
+    stocks only (no ETFs), price>$5, avg volume>2M shares; ranked by
+    avg-volume x price (dollar volume). Also returns each name's earnings
+    date (may be the LAST report when the next isn't scheduled — consumers
+    must check the date is in the future). Returns (tickers, earnings) or
+    None on any failure, so the caller can fall back."""
+    # NOTE: sh_avgvol filters by SHARE volume — a high-priced name (ASML at
+    # ~1M shares/day but >$700 each) would be cut by a 2M-share floor despite
+    # enormous dollar volume. Keep the share floor low; the dollar-volume
+    # ranking below does the real selection.
+    url = ("https://elite.finviz.com/export/screener?v=152"
+           "&f=sh_avgvol_o500,sh_price_o5,ind_stocksonly&ft=3"
+           "&c=1,6,63,65,68&auth=" + token)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=40) as r:
+            body = r.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    if not body.startswith('"Ticker"'):
+        return None                       # login redirect / bad token / format change
+    rows = list(csv.DictReader(io.StringIO(body)))
+    scored, earnings = [], {}
+    for row in rows:
+        t = (row.get("Ticker") or "").upper()
+        if not re.fullmatch(r"[A-Z]{1,5}", t):
+            continue
+        if not (row.get("Market Cap") or "").strip():
+            continue                      # funds/ETFs carry no market cap
+        try:
+            dv = float(row["Average Volume"]) * 1000.0 * float(row["Price"])
+        except (KeyError, ValueError):
+            continue
+        if dv >= MIN_DOLLAR_VOL:
+            scored.append((t, dv))
+            ed = (row.get("Earnings Date") or "").strip()
+            if ed:
+                earnings[t] = ed
+    if len(scored) < size:
+        return None
+    scored.sort(key=lambda x: -x[1])
+    keep = [t for t, _ in scored[:size]]
+    return sorted(keep), {t: earnings[t] for t in keep if t in earnings}
 
 
 def fetch_json(url, tries=3):
@@ -86,6 +145,18 @@ def sec_map():
 
 
 def run(size, prev_list):
+    tok = finviz_token()
+    if tok:
+        fv = finviz_universe(size, tok)
+        if fv:
+            tickers, earnings = fv
+            prev = set(prev_list or [])
+            print("universe via Finviz Elite export (1 call)", file=sys.stderr)
+            return {"as_of": date.today().isoformat(), "size": len(tickers),
+                    "source": "finviz", "tickers": tickers, "earnings": earnings,
+                    "added": sorted(set(tickers) - prev) if prev else [],
+                    "removed": sorted(prev - set(tickers)) if prev else []}
+        print("Finviz export failed — falling back to Yahoo pipeline", file=sys.stderr)
     m = sec_map()
     if not m:
         raise SystemExit("SEC ticker map unavailable")
@@ -136,7 +207,7 @@ def run(size, prev_list):
     tickers = sorted(t for t, _ in scored[:size])
     prev = set(prev_list or [])
     out = {"as_of": date.today().isoformat(), "size": len(tickers),
-           "tickers": tickers,
+           "source": "yahoo", "tickers": tickers, "earnings": {},
            "added": sorted(set(tickers) - prev) if prev else [],
            "removed": sorted(prev - set(tickers)) if prev else []}
     return out
