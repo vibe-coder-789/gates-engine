@@ -142,6 +142,107 @@ def quarterly_dps(cik, ticker):
             continue
     return {}
 
+def _concept_duration(cik, ticker, concepts, unit="USD"):
+    """First available concept -> {quarter_end: value} from 80-100d durations,
+    with fiscal-Q4 synthesized from FY (350-380d) minus interior quarters —
+    same discipline as quarterly_eps. {} if nothing resolves."""
+    for c in concepts:
+        try:
+            d = _fetch("https://data.sec.gov/api/xbrl/companyconcept/CIK%s/us-gaap/%s.json"
+                       % (cik, c), 24, ticker.lower() + "_f_" + c[:26])
+        except Exception:
+            continue
+        q, ann = {}, {}
+        for e in d["units"].get(unit, []):
+            if "start" not in e or "end" not in e or e.get("val") is None:
+                continue
+            s = date.fromisoformat(e["start"]); en = date.fromisoformat(e["end"])
+            dur = (en - s).days
+            if 80 <= dur <= 100:
+                q[en] = e["val"]
+            elif 350 <= dur <= 380:
+                ann[(s, en)] = e["val"]
+        for (s, en), fy in ann.items():
+            inside = [k for k in q if s < k <= en]
+            if en not in q and len(inside) == 3:
+                q[en] = fy - sum(q[k] for k in inside)
+        if len(q) >= 8:
+            return dict(sorted(q.items()))
+    return {}
+
+def _concept_instant(cik, ticker, concepts, unit="USD"):
+    """First available concept -> {date: value} point-in-time (balance sheet)."""
+    for c in concepts:
+        try:
+            d = _fetch("https://data.sec.gov/api/xbrl/companyconcept/CIK%s/us-gaap/%s.json"
+                       % (cik, c), 24, ticker.lower() + "_f_" + c[:26])
+        except Exception:
+            continue
+        out = {}
+        for e in d["units"].get(unit, []):
+            if e.get("val") is None or "end" not in e:
+                continue
+            out[date.fromisoformat(e["end"])] = e["val"]
+        if len(out) >= 4:
+            return dict(sorted(out.items()))
+    return {}
+
+def _ttm(q):
+    """{quarter_end: val} -> {quarter_end: trailing-4 sum} (contiguous only)."""
+    ends = sorted(q)
+    out = {}
+    for i in range(3, len(ends)):
+        w = ends[i-3:i+1]
+        if (w[-1] - w[0]).days <= 310:
+            out[w[-1]] = sum(q[e] for e in w)
+    return out
+
+def fundamentals(cik, ticker):
+    """Best-effort business mechanics from EDGAR — NOT model inputs, only
+    honesty flags the price model can't see: is EPS growth really buybacks,
+    are margins at a cycle extreme, how leveraged is the balance sheet.
+    Every piece degrades to None when a concept is missing."""
+    rev_q = _concept_duration(cik, ticker,
+        ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
+         "SalesRevenueNet", "SalesRevenueGoodsNet"])
+    ni_q = _concept_duration(cik, ticker, ["NetIncomeLoss"])
+    sh_q = _concept_duration(cik, ticker,
+        ["WeightedAverageNumberOfDilutedSharesOutstanding"], unit="shares")
+    debt = _concept_instant(cik, ticker, ["LongTermDebtNoncurrent", "LongTermDebt"])
+    eq = _concept_instant(cik, ticker, ["StockholdersEquity"])
+    out = {"rev_cagr3": None, "share_chg_yr": None, "margin_now": None,
+           "margin_z": None, "debt_yrs_ni": None, "debt_to_equity": None}
+    rev_t, ni_t = _ttm(rev_q), _ttm(ni_q)
+    if rev_t:
+        ends = sorted(rev_t)
+        now = ends[-1]
+        past = [e for e in ends if 1000 <= (now - e).days <= 1190]  # ~3y back
+        if past and rev_t[past[-1]] > 0 and rev_t[now] > 0:
+            out["rev_cagr3"] = (rev_t[now] / rev_t[past[-1]]) ** (1/3.0) - 1
+    if sh_q:
+        ends = sorted(sh_q)
+        now = ends[-1]
+        past = [e for e in ends if 1000 <= (now - e).days <= 1190]
+        if past and sh_q[past[-1]] > 0:
+            out["share_chg_yr"] = (sh_q[now] / sh_q[past[-1]]) ** (1/3.0) - 1
+    if rev_t and ni_t:
+        common = sorted(set(rev_t) & set(ni_t))
+        margins = [ni_t[e] / rev_t[e] for e in common if rev_t[e] > 0]
+        if len(margins) >= 12:
+            mu = statistics.mean(margins); sd = statistics.pstdev(margins) or 1e-9
+            out["margin_now"] = margins[-1]
+            out["margin_z"] = (margins[-1] - mu) / sd
+    if debt and ni_t:
+        d_now = debt[sorted(debt)[-1]]
+        ni_now = ni_t[sorted(ni_t)[-1]]
+        if ni_now > 0:
+            out["debt_yrs_ni"] = d_now / ni_now
+        if eq:
+            e_now = eq[sorted(eq)[-1]]
+            if e_now > 0:
+                out["debt_to_equity"] = d_now / e_now
+    return out
+
 def last_split_date(ticker):
     """Most recent stock-split date (or None). Splits break the basis match
     between Yahoo's retroactively-adjusted prices and EDGAR's as-filed EPS."""
@@ -152,6 +253,29 @@ def last_split_date(ticker):
         return None
     ts = max(int(v["date"]) for v in ev.values())
     return datetime.utcfromtimestamp(ts).date()
+
+def fred_10y():
+    """Monthly 10-year Treasury yield (FRED GS10, percent), no API key.
+    Returns {year*12+month: yield}. Used to condition the multiple anchor —
+    a P/E is roughly an inverse discount rate."""
+    os.makedirs(CACHE, exist_ok=True)
+    key = os.path.join(CACHE, "fred_gs10.csv")
+    if not (os.path.exists(key) and time.time() - os.path.getmtime(key) < 24 * 3600):
+        req = urllib.request.Request("https://fred.stlouisfed.org/graph/fredgraph.csv?id=GS10",
+                                     headers=UA)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read().decode()
+        if not body.startswith("observation_date"):
+            raise RuntimeError("unexpected FRED response")
+        with open(key, "w") as f:
+            f.write(body)
+    out = {}
+    for line in open(key).read().splitlines()[1:]:
+        d, v = line.split(",")
+        if v.strip() not in ("", "."):
+            dt = date.fromisoformat(d)
+            out[dt.year * 12 + dt.month] = float(v)
+    return out
 
 def forward_estimates(ticker):
     """Analyst consensus EPS estimates (Yahoo earningsTrend; cookie+crumb).
@@ -306,11 +430,15 @@ def fit_ou(lnm):
     return {"ok": True, "kappa": kappa, "lnbar": lnbar, "sigma": sigma,
             "half_life": math.log(2)/kappa, "b": b, "resid_sd_m": s}
 
-def estimate(panel):
-    """All model parameters from a panel (used full-sample and walk-forward)."""
+def estimate(panel, rates=None):
+    """All model parameters from a panel (used full-sample and walk-forward).
+    rates: optional {year*12+month: 10y yield} — fits the rates-conditioned
+    anchor variant alongside (past-only by construction: pairs come from the
+    panel)."""
     # multiple hygiene: near-zero-EPS episodes create P/E spikes that are noise,
     # not signal — drop multiples outside a sane band before fitting the OU
-    ms = [r["m"] for r in panel if r["m"] and 3.0 <= r["m"] <= 75.0]
+    md = [(r["date"], r["m"]) for r in panel if r["m"] and 3.0 <= r["m"] <= 75.0]
+    ms = [m for _, m in md]
     if len(ms) < MIN_FIT_MONTHS:
         return None
     lo, hi = pctl(ms, 0.02), pctl(ms, 0.98)
@@ -386,11 +514,55 @@ def estimate(panel):
             if f and f.get("ok"):
                 if f["sigma"] > 0.60: f["sigma"] = 0.60
                 boots.append({"kappa": f["kappa"], "lnbar": f["lnbar"], "sigma": f["sigma"]})
+    # --- rates-conditioned anchor variant: lnM = a + b*y10 + OU(residual).
+    # Theory: P/E ~ inverse discount rate. Adopt-or-retire via walk-forward.
+    rc = None
+    if rates:
+        pairs = [(rates[d.year * 12 + d.month], lnm[i])
+                 for i, (d, _) in enumerate(md) if d.year * 12 + d.month in rates]
+        if len(pairs) >= MIN_FIT_MONTHS:
+            ys = [p[0] for p in pairs]; lms = [p[1] for p in pairs]
+            n_ = len(ys); my_ = sum(ys) / n_; ml_ = sum(lms) / n_
+            sxx = sum((y - my_) ** 2 for y in ys)
+            if sxx > 1e-9:
+                b_r = sum((ys[i] - my_) * (lms[i] - ml_) for i in range(n_)) / sxx
+                a_r = ml_ - b_r * my_
+                resid = [lms[i] - (a_r + b_r * ys[i]) for i in range(n_)]
+                ssr = sum(v * v for v in resid)
+                sst = sum((v - ml_) ** 2 for v in lms) or 1e-9
+                ou_r = fit_ou(resid)
+                if ou_r and ou_r.get("ok"):
+                    if ou_r["sigma"] > 0.60:
+                        ou_r["sigma"] = 0.60
+                    y_now = ys[-1]
+                    lnbar_now = a_r + b_r * y_now + ou_r["lnbar"]
+                    # same anti-explosion clamp as the constant anchor
+                    med_l = sorted(lnm)[len(lnm) // 2]
+                    sd_l = statistics.pstdev(lnm) or 1e-6
+                    lnbar_now = min(max(lnbar_now, med_l - 1.5 * sd_l), med_l + 1.5 * sd_l)
+                    rc = {"a": a_r, "b": b_r, "r2": 1 - ssr / sst, "y_now": y_now,
+                          "lnbar_now": lnbar_now, "kappa": ou_r["kappa"],
+                          "sigma": ou_r["sigma"], "resid_sd_m": ou_r.get("resid_sd_m", 0.04)}
+    # --- cycle position: where trailing EPS sits vs its own log-linear trend.
+    # For cyclicals, above-trend earnings tend to mean-revert; the variant
+    # shrinks drift toward trend. Adopt-or-retire via walk-forward.
+    cyc = None
+    lnE_s = [math.log(e) for e in eps_series if e > 0]
+    if len(lnE_s) >= 48:
+        n_ = len(lnE_s); xs_ = list(range(n_))
+        mx_ = (n_ - 1) / 2.0; me_ = sum(lnE_s) / n_
+        sxx = sum((x - mx_) ** 2 for x in xs_)
+        b_t = sum((xs_[i] - mx_) * (lnE_s[i] - me_) for i in range(n_)) / sxx
+        a_t = me_ - b_t * mx_
+        resid = [lnE_s[i] - (a_t + b_t * xs_[i]) for i in range(n_)]
+        sd_t = statistics.pstdev(resid) or 1e-6
+        gap = lnE_s[-1] - (a_t + b_t * (n_ - 1))
+        cyc = {"gap": gap, "z": gap / sd_t, "trend_g": b_t * 12}
     return {"ou": ou, "g": {"bear": g25, "base": g50, "bull": g75},
             "sigE": sigE, "rho": max(-0.9, min(0.9, rho)),
             "m_pct": m_p, "n_months": len(ms),
             "regime_z": round(regime_z, 2), "rerating": rerating,
-            "boots": boots}
+            "boots": boots, "rates": rc, "cycle": cyc}
 
 # ----------------------------------------------------------------- simulation
 
@@ -512,11 +684,36 @@ def unified_g_path(est, fwd, horizon_y, asof):
     return [BLEND_W * _fwd_growth_at(t / 12.0, c0, c1, tt[0], tt[1], h, horizon_y)
             + (1 - BLEND_W) * h for t in range(1, int(horizon_y * 12) + 1)]
 
+# ------------------------------------------------------------------- variants
+
+def est_rates_variant(est):
+    """est copy whose OU anchor is the rates-conditioned one (yield held at its
+    origin value over the horizon). None if the rates fit is unavailable."""
+    rc = est.get("rates")
+    if not rc:
+        return None
+    ou2 = {"ok": True, "kappa": rc["kappa"], "lnbar": rc["lnbar_now"],
+           "sigma": rc["sigma"], "half_life": math.log(2) / rc["kappa"],
+           "b": 0.0, "resid_sd_m": rc["resid_sd_m"]}
+    e2 = dict(est); e2["ou"] = ou2; e2["boots"] = []
+    return e2
+
+def cycle_g(est, H):
+    """Cycle-adjusted base drift: close half the EPS-vs-trend gap over the
+    horizon. None if no cycle fit."""
+    cyc = est.get("cycle")
+    if not cyc:
+        return None
+    return est["g"]["base"] - cyc["gap"] / (2.0 * H)
+
 # ------------------------------------------------------------------- backtest
 
-def backtest(panel, bt_h, n_small=1500):
+def backtest(panel, bt_h, n_small=1500, variant=None, rates=None):
     """Walk-forward: at each monthly origin fit on past only, predict H-yr dist,
-       compare with realized (total-return via adjclose). Plus baselines."""
+       compare with realized (total-return via adjclose). Plus baselines.
+       variant: None (production model) | 'rates' | 'cycle' — the adopt-or-
+       retire harness; a variant silently falls back to baseline at origins
+       where its extra fit is unavailable, so comparisons share origins."""
     H = bt_h; steps_fwd = H*12
     res = []
     for i in range(MIN_FIT_MONTHS, len(panel)-steps_fwd):
@@ -524,11 +721,18 @@ def backtest(panel, bt_h, n_small=1500):
         row = sub[-1]
         if not row["m"] or row["m"] <= 0:
             continue
-        est = estimate(sub)
+        est = estimate(sub, rates=rates if variant == "rates" else None)
         if est is None or not est["ou"]["ok"]:
             continue
-        sim = simulate(row["px"], row["eps"], row["m"], est, H, n_small,
-                       seed=100+i)
+        sim_est, g_ov = est, None
+        if variant == "rates":
+            e2 = est_rates_variant(est)
+            if e2 is not None:
+                sim_est = e2
+        elif variant == "cycle":
+            g_ov = cycle_g(est, H)
+        sim = simulate(row["px"], row["eps"], row["m"], sim_est, H, n_small,
+                       g_override=g_ov, seed=100+i)
         ann = sim["ann_returns"]
         fut = panel[i+steps_fwd]
         realized = (fut["adj"]/row["adj"])**(1/H) - 1
@@ -589,6 +793,42 @@ def bt_metrics(res, H):
             "mae_model": round(mae_m, 4), "mae_gbm": round(mae_g, 4),
             "mae_const8": round(mae_c, 4), "mae_comb": round(mae_e, 4),
             "final_weights": res[-1]["weights"]}
+
+# ----------------------------------------------------------------- experiment
+
+def experiment(tickers, bt_h=3, n_small=800):
+    """Adopt-or-retire harness: walk-forward MAE/IC for the production model vs
+    the rates-anchor and cycle-drift variants, same origins, same paths."""
+    rates = fred_10y()
+    out = {"as_of": date.today().isoformat(), "bt_h": bt_h, "tickers": {}}
+    for t in tickers:
+        try:
+            cik, _ = ticker_to_cik(t)
+            eps_q = quarterly_eps(cik, t); dps_q = quarterly_dps(cik, t)
+            lsd = last_split_date(t)
+            panel = build_panel(monthly_prices(t), eps_q, dps_q, min_q_end=lsd)
+            rows = {}
+            for name, kw in (("baseline", {}),
+                             ("rates", {"variant": "rates", "rates": rates}),
+                             ("cycle", {"variant": "cycle"})):
+                m = bt_metrics(backtest(panel, bt_h, n_small=n_small, **kw), bt_h)
+                rows[name] = {k: m.get(k) for k in
+                              ("n", "mae_model", "ic_pearson", "cov90", "hit_6pct")}
+            out["tickers"][t.upper()] = rows
+            print("%-5s n=%s  MAE base %.4f | rates %.4f | cycle %.4f" %
+                  (t, rows["baseline"]["n"],
+                   rows["baseline"]["mae_model"] or float("nan"),
+                   rows["rates"]["mae_model"] or float("nan"),
+                   rows["cycle"]["mae_model"] or float("nan")), file=sys.stderr)
+        except SystemExit as e:
+            print("SKIP %s: %s" % (t, e), file=sys.stderr)
+        except Exception as e:
+            print("FAIL %s: %s: %s" % (t, type(e).__name__, e), file=sys.stderr)
+    os.makedirs(REPORTS, exist_ok=True)
+    with open(os.path.join(REPORTS, "experiment.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    print(json.dumps(out, indent=2))
+    return out
 
 # ------------------------------------------------------------------ reporting
 # (SVG chart builders kept minimal; palette = session-validated pairs)
@@ -817,6 +1057,11 @@ def run(ticker, horizon=5, paths=8000, bt_h=3, do_backtest=True):
             "fy1_g": {k: (None if v is None else round(v, 3)) for k, v in fwd["g"]["fy1"].items()},
             "analysts": fwd["fy1"]["n"],
             "rev_30d": [fwd["fy1"]["rev_up30"], fwd["fy1"]["rev_dn30"]]})
+    try:
+        summary["mechanics"] = {k: (None if v is None else round(v, 3))
+                                for k, v in fundamentals(cik, ticker).items()}
+    except Exception:
+        pass
     print(json.dumps(summary, indent=2))
     return summary
 
@@ -854,6 +1099,11 @@ def bundle(tickers, horizon=5, paths=5000, bt_h=3, out="bundle.json"):
                                 "g_low": None if gg["low"] is None else round(gg["low"], 3),
                                 "g_avg": None if gg["avg"] is None else round(gg["avg"], 3),
                                 "g_high": None if gg["high"] is None else round(gg["high"], 3)}
+            try:
+                fund = fundamentals(cik, t)
+                fund = {k: (None if v is None else round(v, 3)) for k, v in fund.items()}
+            except Exception:
+                fund = None
             res = backtest(panel, bt_h)
             mets = bt_metrics(res, bt_h)
             rets_now = [math.log(panel[j]["adj"]/panel[j-1]["adj"]) for j in range(1, len(panel))]
@@ -877,6 +1127,7 @@ def bundle(tickers, horizon=5, paths=5000, bt_h=3, out="bundle.json"):
                            "m_pct": {str(k): round(v, 1) for k, v in est["m_pct"].items()},
                            "regime_z": est["regime_z"], "rerating": est["rerating"],
                            "anchor_clamped": est["ou"].get("anchor_clamped", False),
+                           "cycle_z": round(est["cycle"]["z"], 2) if est.get("cycle") else None,
                            "n_months": est["n_months"], "n_boots": len(est.get("boots") or [])},
                 "fan": {str(p): [round(v, 2) for v in sim["fan"][p]] for p in sim["fan"]},
                 "scen": {k: {"g": round(v["g"], 3), "m_exit": round(v["m_exit"], 1),
@@ -885,7 +1136,7 @@ def bundle(tickers, horizon=5, paths=5000, bt_h=3, out="bundle.json"):
                          "med": round(pctl(ann, .50), 3), "p75": round(pctl(ann, .75), 3),
                          "p95": round(pctl(ann, .95), 3),
                          "p_loss": round(sum(1 for r in ann if r < 0)/len(ann), 2)},
-                "drift": drift,
+                "drift": drift, "fund": fund,
                 "hist": hist, "mult": mult, "gbm_now": gbm_now,
                 "bt": {"points": [[r["date"], round(r["pred_med"], 3), round(r["pred_comb"], 3),
                                    round(r["realized"], 3)] for r in res],
@@ -909,7 +1160,10 @@ if __name__ == "__main__":
              for a in sys.argv[1:] if a.startswith("--")}
     if not args:
         print(__doc__); sys.exit(1)
-    if args[0] == "bundle":
+    if args[0] == "experiment":
+        experiment(args[1:] or ["EME"], bt_h=int(flags.get("--bt-h", 3)),
+                   n_small=int(flags.get("--paths", 800)))
+    elif args[0] == "bundle":
         bundle(args[1:] or ["EME"],
                horizon=int(flags.get("--horizon", 5)),
                paths=int(flags.get("--paths", 5000)),

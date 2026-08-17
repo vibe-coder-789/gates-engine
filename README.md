@@ -86,6 +86,21 @@ per-ticker A/B/C grade in the Terminal encodes exactly this.
 
 ## Retired experiments
 
+- **Rates-conditioned multiple anchor** (v0.4 experiment, retired): lnM̄ =
+  a + b·(10y Treasury yield) with OU on the residual — theoretically sound
+  (P/E ≈ inverse discount rate), empirically worse: walk-forward MAE degraded
+  on 5 of 7 testable names, improved on 1. The multiple's own history beats
+  yield conditioning at single-name horizon. Code remains (`--variant rates`
+  in the experiment harness) as the record.
+- **Cycle-position drift** (v0.4 experiment, retired *as an automatic
+  adjustment*): shrink EPS drift toward the log-linear earnings trend. Big
+  wins exactly where the model is weakest (MU MAE 0.32→0.25, COHR IC
+  −0.22→+0.23) but losses on steady names — and no ex-ante covariate we have
+  (σ_E included) separates the winners from the losers, so adopting it
+  conditionally would be fitting the condition to the answer. The cycle
+  position (EPS-vs-trend z) ships as a **flag** in the Terminal instead:
+  real information, human judgment required.
+
 - **Cross-sectional factor layer** (v0.3, `xsection.py`, removed): monthly
   VALUE/MOM/GROWTH/LOWVOL/REVGAP ranking over a 272-name large-cap universe,
   2012–2026. Result: no factor achieved |t| > 1.1; the composite long-short
