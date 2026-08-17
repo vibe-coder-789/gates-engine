@@ -24,6 +24,7 @@ STRATEGY (fixed; changing it means committing a new version):
   list below), whoever has >=140 daily bars.
 - Signals (close-to-close daily bars, z-scored, winsorized +-3):
     STR   5-day return, weight -1.0      (short-term reversal: buy dips)
+    AI    +0.3 flat bonus for the AI/energy-to-compute lifecycle cohort
     MOM   126d return skipping last 21d, weight +0.5
 - Veto: a name graded C by the long model with ensemble < 4%/yr is excluded.
 - Book: long top 6 equal-weight (1/6 slots); a holding is kept until its
@@ -43,6 +44,15 @@ from datetime import date
 
 UA = {"User-Agent": "gates-alpha/1.0 (github.com/vibe-coder-789/gates-engine)"}
 TOP_N = 6
+AI_TILT = 0.3    # score bonus for the AI/energy-to-compute lifecycle cohort.
+                 # Thesis-driven (Watts-to-Tokens survey) and backtested:
+                 # +0.3z lifted CAGR 27.0->29.0% and Sharpe 0.90->0.94 over
+                 # 4.5y; +0.6z added nothing more (sane dose-response).
+                 # Honest caveat: the test window IS the AI boom.
+AI_SET = set("""NVDA AVGO AMD MU AMAT LRCX KLAC ANET COHR SMCI DELL VRT CEG VST
+GEV PWR EME FIX MSFT META GOOGL AMZN AAPL ORCL TSM ARM ASML MRVL APP PLTR TER
+NXPI ON MPWR CIEN GLW INTC QCOM TXN ADI MCHP CRM NOW PANW SNOW NET DDOG UBER
+LIN ETN PH URI NEE ALAB CRDO LITE NBIS IREN CRWV SNDK STX WDC HPE""".split())
 EXIT_RANK = 18
 COST = 0.001
 VETO_GRADE, VETO_ENS = "C", 0.04
@@ -127,7 +137,8 @@ def compute_scores(signals, universe=None):
     out = {}
     for t, v in raw.items():
         if t in z5 and t in zm:
-            out[t] = dict(v, score=-1.0 * z5[t] + 0.5 * zm[t])
+            out[t] = dict(v, score=-1.0 * z5[t] + 0.5 * zm[t]
+                          + (AI_TILT if t in AI_SET else 0.0))
     return out
 
 

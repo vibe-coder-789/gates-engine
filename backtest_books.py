@@ -31,6 +31,14 @@ COST = alpha.COST
 TOP_N = alpha.TOP_N
 WARMUP = 130
 
+# AI / energy-to-compute lifecycle cohort (from the Watts-to-Tokens survey):
+# energy & power infra -> chips & equipment -> networking/optics -> datacenter
+# builders -> hyperscalers/models. Used by the ai-tilt experiment.
+AI_SET = set("""NVDA AVGO AMD MU AMAT LRCX KLAC ANET COHR SMCI DELL VRT CEG VST
+GEV PWR EME FIX MSFT META GOOGL AMZN AAPL ORCL TSM ARM ASML MRVL APP PLTR TER
+NXPI ON MPWR CIEN GLW INTC QCOM TXN ADI MCHP CRM NOW PANW SNOW NET DDOG UBER
+LIN ETN PH URI NEE""".split())
+
 
 def daily_bars(ticker, years):
     os.makedirs(CACHE, exist_ok=True)
@@ -81,7 +89,7 @@ def load(years):
     return data, spy
 
 
-def simulate(data, spy, fill="close", spy_filter=False, exit_rank=None):
+def simulate(data, spy, fill="close", spy_filter=False, exit_rank=None, ai_tilt=0.0):
     exit_rank = exit_rank or alpha.EXIT_RANK
     # calendar = SPY's days; per-ticker day->index map
     days = [r[0] for r in spy]
@@ -103,7 +111,8 @@ def simulate(data, spy, fill="close", spy_filter=False, exit_rank=None):
                       "mom": c[i - 21][2] / c[i - 126][2] - 1,
                       "i": i}
         z5, zm = zmap({t: v["r5"] for t, v in raw.items()}), zmap({t: v["mom"] for t, v in raw.items()})
-        scores = {t: -1.0 * z5[t] + 0.5 * zm[t] for t in raw if t in z5 and t in zm}
+        scores = {t: -1.0 * z5[t] + 0.5 * zm[t] + (ai_tilt if t in AI_SET else 0.0)
+                  for t in raw if t in z5 and t in zm}
         if len(scores) < 30:
             continue
         ranked = sorted(scores, key=lambda t: -scores[t])
@@ -179,10 +188,9 @@ if __name__ == "__main__":
     print("loaded %d ok" % len(data), file=sys.stderr)
     out = {"as_of": date.today().isoformat(), "universe_loaded": len(data), "variants": {}}
     for name, kw in (
-            ("deployed (close-fill, exit18)", {"fill": "close"}),
-            ("honest fills (next-open)", {"fill": "open"}),
-            ("next-open + SPY 200dma filter", {"fill": "open", "spy_filter": True}),
-            ("next-open + exit rank 12", {"fill": "open", "exit_rank": 12})):
+            ("deployed (next-open, no tilt)", {"fill": "open"}),
+            ("ai-tilt +0.3z", {"fill": "open", "ai_tilt": 0.3}),
+            ("ai-tilt +0.6z", {"fill": "open", "ai_tilt": 0.6})):
         out["variants"][name] = simulate(data, spy, **kw)
         print("%-32s %s" % (name, out["variants"][name]), file=sys.stderr)
     print(json.dumps(out, indent=1))
