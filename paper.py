@@ -31,6 +31,7 @@ TOP_N = 4
 COST = 0.001          # 10 bps per side
 DRIFT_PP = 0.05       # rebalance threshold, absolute weight
 MAX_PLOSS = 0.40
+KILL_DD = 0.15        # book down >15% from its peak: stop opening positions
 
 
 def quote(ticker):
@@ -122,11 +123,17 @@ def run(state, signals):
             else:
                 state["positions"][t] = cur
 
+    # risk layer: drawdown kill switch. Exits still allowed; no new buys.
+    peak = max([h.get("v", state["initial"]) for h in (state.get("history") or [])]
+               + [state["initial"], port_value()])
+    halted = port_value() / peak - 1 < -KILL_DD
     # 1. exit anything no longer targeted
     for t in held:
         if t not in target_names:
             sell(t, "no longer eligible / out of top %d" % TOP_N)
     # 2. rebalance toward equal weights (only past drift threshold, or new)
+    if halted:
+        target_names = []          # no entries while halted
     if target_names:
         v = port_value()
         tw = 1.0 / TOP_N          # unfilled slots stay in cash by design
@@ -151,6 +158,7 @@ def run(state, signals):
                                      if p["avg_cost"] else None}
                       for t, p in sorted(state["positions"].items())},
         "signals_asof": signals.get("as_of"),
+        "risk_halted": halted,
         "targets": [{"ticker": t, "ensemble_pct": round(e * 100, 1)} for t, e in targets]}
     state["log"] = (state.get("log") or []) + trades
     state["log"] = state["log"][-500:]

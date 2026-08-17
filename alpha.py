@@ -15,9 +15,12 @@ STRATEGY (fixed; changing it means committing a new version):
 - Book: long top 6 equal-weight (1/6 slots); a holding is kept until its
   composite rank decays past 18 (turnover buffer), then sold.
 - Costs 10 bps per side; fractional shares; cash earns nothing.
-- Execution: at the daily close (run after US close). Honesty note: fills at
-  the same close the signal is computed from — optimistic by up to one spread;
-  treat the track record accordingly.
+- Execution: signals from COMPLETED daily bars only (today's partial bar is
+  excluded); fills at the live market price when the run executes — the
+  routine is scheduled just after the US open, making this next-open
+  execution, the variant that walk-forward-backtested best (Sharpe 0.90 vs
+  0.67 for same-close fills over 4.5y; see backtest_books.py).
+- Risk: book >15% below its peak halts new entries until it recovers.
 - Benchmark: SPY buy-and-hold from inception.
 """
 
@@ -29,6 +32,7 @@ TOP_N = 6
 EXIT_RANK = 18
 COST = 0.001
 VETO_GRADE, VETO_ENS = "C", 0.04
+KILL_DD = 0.15   # book down >15% from its peak: exits only, no new entries
 
 UNIVERSE = """
 AAPL MSFT AMZN META GOOGL AVGO ORCL CRM AMD QCOM TXN MU AMAT LRCX KLAC ANET
@@ -84,17 +88,25 @@ def compute_scores(signals):
         for t, s in signals.get("tickers", {}).items():
             if s.get("grade") == VETO_GRADE and (s.get("ensemble") or 0) < VETO_ENS:
                 veto.add(t.upper())
+    import datetime as _dt
+    today_utc = _dt.datetime.utcnow().date()
     raw = {}
     for t in UNIVERSE:
         if t in veto:
             continue
         bars = daily_closes(t)
-        if len(bars) < 140:
+        if len(bars) < 141:
             continue
-        px = [p for _, p in bars]
+        live = bars[-1][1]                     # latest price = fill price
+        # signals use completed bars only: drop today's (partial) bar
+        done = bars[:-1] if _dt.datetime.utcfromtimestamp(bars[-1][0]).date() == today_utc \
+               else bars
+        px = [p for _, p in done]
+        if len(px) < 140:
+            continue
         r5 = px[-1] / px[-6] - 1
         mom = px[-22] / px[-127] - 1
-        raw[t] = {"px": px[-1], "r5": r5, "mom": mom}
+        raw[t] = {"px": live, "r5": r5, "mom": mom}
     z5 = zmap({t: v["r5"] for t, v in raw.items()})
     zm = zmap({t: v["mom"] for t, v in raw.items()})
     out = {}
@@ -140,8 +152,12 @@ def run(state, signals):
             sell(t, "left universe / vetoed / no data")
         elif rank[t] > EXIT_RANK:
             sell(t, "rank decayed to %d (> %d)" % (rank[t], EXIT_RANK))
+    # risk layer: drawdown kill switch — exits above still ran; block entries
+    peak = max([h.get("v", state["initial"]) for h in (state.get("history") or [])]
+               + [state["initial"], port_value()])
+    halted = port_value() / peak - 1 < -KILL_DD
     # entries: fill empty slots with best-ranked names not held
-    slots = TOP_N - len(state["positions"])
+    slots = 0 if halted else (TOP_N - len(state["positions"]))
     v = port_value()
     for t in ranked:
         if slots <= 0:
@@ -175,6 +191,7 @@ def run(state, signals):
                           "pnl_pct": round((px[t] / p["avg_cost"] - 1) * 100, 1)}
                       for t, p in sorted(state["positions"].items())},
         "universe_scored": len(scores),
+        "risk_halted": halted,
         "top10_today": [{"t": t, "score": round(scores[t]["score"], 2)} for t in ranked[:10]]}
     state["log"] = ((state.get("log") or []) + trades)[-800:]
     # equity snapshot for the monitoring dashboard (one per date, latest wins)

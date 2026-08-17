@@ -84,6 +84,32 @@ reversion systematically fades regime changes. The model's honest use is as a
 *scenario framer and expectations translator*, not a return predictor. The
 per-ticker A/B/C grade in the Terminal encodes exactly this.
 
+## Paper-trading books
+
+Two $1,000 simulated books trade the system's outputs (fake money, real
+prices, mechanical rules; state in Gmail drafts, runs via cloud routines,
+live dashboard reads state read-only):
+
+- **Long book** (`paper.py`, weekly): grade A/B + P(loss)<40% gate, top-4 by
+  ensemble at 25% slots, unfilled slots stay cash.
+- **Alpha book** (`alpha.py`, daily): −z(5d return) + 0.5·z(6m momentum) over
+  ~100 liquid names, top-6, exit at rank>18; the earnings model can veto,
+  never nominate. Execution is signal-on-completed-bars → fill-at-next-open,
+  adopted after `backtest_books.py` (4.5y, 107 names, 10bps): next-open
+  Sharpe 0.90 vs 0.67 for same-close fills; a SPY 200-dma entry filter and a
+  tighter exit rank were tested and retired (no Sharpe gain). Survivorship
+  caveat applies; ~130×/yr turnover means real-world costs would bite harder
+  than 10bps.
+- **Risk layer (both)**: a book >15% below its peak stops opening new
+  positions until it recovers.
+
+Design stance, informed by the 2025–26 open-source landscape (TradingAgents,
+ai-hedge-fund, AI-Trader/Agent-Market-Arena benchmarks): deterministic code
+makes every trading decision; LLM agents only orchestrate (state, delivery,
+error handling). The live-benchmark literature keeps finding instability and
+memorized-history contamination exactly where LLMs sit inside the decision
+loop — so here they don't.
+
 ## Retired experiments
 
 - **Rates-conditioned multiple anchor** (v0.4 experiment, retired): lnM̄ =
