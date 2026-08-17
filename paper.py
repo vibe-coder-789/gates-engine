@@ -154,6 +154,10 @@ def run(state, signals):
         "targets": [{"ticker": t, "ensemble_pct": round(e * 100, 1)} for t, e in targets]}
     state["log"] = (state.get("log") or []) + trades
     state["log"] = state["log"][-500:]
+    # equity snapshot for the monitoring dashboard (one per date, latest wins)
+    snap = {"d": today, "v": round(v, 2), "s": round(spy, 2)}
+    state["history"] = ([h for h in (state.get("history") or []) if h.get("d") != today]
+                        + [snap])[-600:]
     state["last_run"] = today
     return {"state": state, "trades": trades, "valuation": valuation}
 

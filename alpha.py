@@ -177,6 +177,10 @@ def run(state, signals):
         "universe_scored": len(scores),
         "top10_today": [{"t": t, "score": round(scores[t]["score"], 2)} for t in ranked[:10]]}
     state["log"] = ((state.get("log") or []) + trades)[-800:]
+    # equity snapshot for the monitoring dashboard (one per date, latest wins)
+    snap = {"d": today, "v": round(v, 2), "s": None if spy is None else round(spy, 2)}
+    state["history"] = ([h for h in (state.get("history") or []) if h.get("d") != today]
+                        + [snap])[-600:]
     state["last_run"] = today
     return {"state": state, "trades": trades, "valuation": valuation}
 
