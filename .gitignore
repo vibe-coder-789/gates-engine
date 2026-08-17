@@ -5,3 +5,4 @@ bundle.json
 *.b64gz
 __pycache__/
 experiments/
+.finviz
