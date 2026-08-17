@@ -5,6 +5,15 @@ mechanical rules, daily cadence. Separate thread from the long book: the
 earnings model (signals.json) may VETO names, never nominate them.
 
     python3 alpha.py --state=astate.json [--signals=signals.json] [--out=new.json]
+                     [--dry-run] [--vetoes=vetoes.json]
+
+--dry-run: compute and print intended trades WITHOUT mutating state — used by
+the LLM event-review node to see proposed entries before execution.
+--vetoes: {"TICKER": "reason"} — entries for these names are BLOCKED and
+logged to state["veto_log"] with the price at veto time, so the node's
+judgment can be scored later (counterfactual: what the vetoed entry would
+have returned). The veto node has asymmetric authority: it can only block
+entries, never initiate trades, touch exits, or enlarge positions.
 
 STRATEGY (fixed; changing it means committing a new version):
 - Universe: ~60 liquid US large caps (below), whoever has >=140 daily bars.
@@ -116,7 +125,8 @@ def compute_scores(signals):
     return out
 
 
-def run(state, signals):
+def run(state, signals, vetoes=None):
+    vetoes = vetoes or {}
     today = date.today().isoformat()
     scores = compute_scores(signals)
     if len(scores) < 30:
@@ -159,10 +169,15 @@ def run(state, signals):
     # entries: fill empty slots with best-ranked names not held
     slots = 0 if halted else (TOP_N - len(state["positions"]))
     v = port_value()
+    vetoed_today = []
     for t in ranked:
         if slots <= 0:
             break
         if t in state["positions"]:
+            continue
+        if t.upper() in vetoes:
+            vetoed_today.append({"date": today, "ticker": t, "px": round(px[t], 2),
+                                 "reason": str(vetoes[t.upper()])[:200]})
             continue
         notional = min(v / TOP_N, state["cash"] / (1 + COST))
         if notional < 5:
@@ -192,7 +207,9 @@ def run(state, signals):
                       for t, p in sorted(state["positions"].items())},
         "universe_scored": len(scores),
         "risk_halted": halted,
+        "vetoed_today": vetoed_today,
         "top10_today": [{"t": t, "score": round(scores[t]["score"], 2)} for t in ranked[:10]]}
+    state["veto_log"] = ((state.get("veto_log") or []) + vetoed_today)[-300:]
     state["log"] = ((state.get("log") or []) + trades)[-800:]
     # equity snapshot for the monitoring dashboard (one per date, latest wins)
     snap = {"d": today, "v": round(v, 2), "s": None if spy is None else round(spy, 2)}
@@ -203,7 +220,8 @@ def run(state, signals):
 
 
 if __name__ == "__main__":
-    flags = {a.split("=")[0]: a.split("=")[1] for a in sys.argv[1:] if "=" in a}
+    import copy
+    flags = {a.split("=")[0]: (a.split("=")[1] if "=" in a else True) for a in sys.argv[1:]}
     with open(flags["--state"]) as f:
         state = json.load(f)
     signals = None
@@ -213,8 +231,17 @@ if __name__ == "__main__":
                 signals = json.load(f)
         except Exception:
             signals = None
-    out = run(state, signals)
-    if "--out" in flags:
+    vetoes = {}
+    if "--vetoes" in flags:
+        try:
+            with open(flags["--vetoes"]) as f:
+                vetoes = {k.upper(): v for k, v in json.load(f).items()}
+        except Exception:
+            vetoes = {}
+    dry = bool(flags.get("--dry-run"))
+    out = run(copy.deepcopy(state) if dry else state, signals, vetoes=vetoes)
+    if "--out" in flags and not dry:
         with open(flags["--out"], "w") as f:
             json.dump(out["state"], f, indent=1)
-    print(json.dumps({"trades": out["trades"], "valuation": out["valuation"]}, indent=1))
+    print(json.dumps({"dry_run": dry, "trades": out["trades"],
+                      "valuation": out["valuation"]}, indent=1))
