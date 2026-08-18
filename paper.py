@@ -170,10 +170,36 @@ def run(state, signals):
     return {"state": state, "trades": trades, "valuation": valuation}
 
 
+def mark(state):
+    """Mark-to-market only: revalue holdings at current prices and append the
+    daily equity snapshot. NO trades, NO position/cash/log changes — safe to
+    persist without the email gate (idempotent: one snapshot per date)."""
+    today = date.today().isoformat()
+    px = {t: quote(t) for t in state["positions"]}
+    spy = quote("SPY")
+    v = state["cash"] + sum(p["shares"] * px[t] for t, p in state["positions"].items())
+    snap = {"d": today, "v": round(v, 2), "s": round(spy, 2)}
+    state["history"] = ([h for h in (state.get("history") or []) if h.get("d") != today]
+                        + [snap])[-600:]
+    ret = (v / state["initial"] - 1) * 100
+    spy_ret = (spy / state["spy_inception_px"] - 1) * 100 if state.get("spy_inception_px") else None
+    return {"state": state, "trades": [],
+            "valuation": {"date": today, "mark_only": True, "value": round(v, 2),
+                          "return_pct": round(ret, 2),
+                          "spy_return_pct": None if spy_ret is None else round(spy_ret, 2)}}
+
+
 if __name__ == "__main__":
-    flags = {a.split("=")[0]: a.split("=")[1] for a in sys.argv[1:] if "=" in a}
+    flags = {a.split("=")[0]: (a.split("=")[1] if "=" in a else True) for a in sys.argv[1:]}
     with open(flags["--state"]) as f:
         state = json.load(f)
+    if flags.get("--mark-only"):
+        out = mark(state)
+        if "--out" in flags:
+            with open(flags["--out"], "w") as f:
+                json.dump(out["state"], f, indent=1)
+        print(json.dumps({"trades": [], "valuation": out["valuation"]}, indent=1))
+        sys.exit(0)
     with open(flags["--signals"]) as f:
         signals = json.load(f)
     out = run(state, signals)
